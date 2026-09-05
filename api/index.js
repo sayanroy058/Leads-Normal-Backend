@@ -2320,7 +2320,8 @@ app.use("/*", cors({
   origin: [
     "http://localhost:5173",
     "http://localhost:3000",
-    "https://rosybrown-pig-742740.hostingersite.com",
+    "https://www.gradleadai.com",
+    "https://gradleadai.com",
     ...extraOrigins
   ],
   credentials: true
