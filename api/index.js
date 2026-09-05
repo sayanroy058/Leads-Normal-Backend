@@ -2343,7 +2343,7 @@ if (process.env.NODE_ENV !== "production") {
   console.log(`Backend running on http://localhost:${port}`);
   serve({ fetch: app.fetch, port });
 } else {
-  console.log("Leads Normal backend in serverless mode \u2014 no listener started.");
+  console.log("GradLeadAI backend in serverless mode \u2014 no listener started.");
 }
 
 // src/vercel.ts
