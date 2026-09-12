@@ -3,20 +3,23 @@
   "version": "1.0.0",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "scripts": {
     "dev": "tsx watch --env-file=.env src/index.ts",
     "start": "node --env-file=.env --import tsx/esm src/index.ts",
-    "build": "esbuild src/vercel.ts --bundle --platform=node --format=esm --target=node20 --packages=external --outfile=api/index.js",
+    "build": "esbuild src/vercel.ts --bundle --platform=node --format=esm --target=node22 --packages=external --outfile=api/index.js",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@ai-sdk/openai-compatible": "^3.0.0",
+    "@ai-sdk/gateway": "^4.0.33",
+    "@ai-sdk/openai-compatible": "^3.0.18",
+    "@ai-sdk/provider": "^4.0.4",
+    "@ai-sdk/provider-utils": "^5.0.16",
     "@hono/node-server": "^2.0.12",
     "@libsql/client": "^0.17.4",
     "@node-rs/argon2": "^2.0.2",
-    "ai": "^7.0.2",
+    "ai": "^7.0.44",
     "bcryptjs": "^3.0.3",
     "hono": "^4.6.0",
     "imapflow": "^1.7.1",
