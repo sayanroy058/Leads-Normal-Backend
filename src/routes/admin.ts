@@ -1,10 +1,8 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import bcrypt from "bcryptjs";
-import type { Client } from "@libsql/client";
 import { getDb, generateToken } from "../db";
 import { authenticateAdmin, type AuthedUser } from "../middleware/auth";
-import { syncUserInbox } from "../lib/email-sync";
 
 const router = new Hono<{ Variables: { admin: AuthedUser } }>();
 
@@ -33,31 +31,6 @@ const updateEmailCredsSchema = z.object({
 const resetPasswordSchema = z.object({ password: z.string().min(6) });
 
 const USER_COLUMNS = "id, name, email, is_admin, disabled, gmail_email, created_at";
-
-/**
- * Run a first inbox sync for a user right after an admin connects (or
- * changes) their Gmail account. Awaited, not fire-and-forget: this backend
- * runs on Vercel's classic Node (req, res) handler, which has no reliable
- * way to keep work running after the response is sent (no `waitUntil` —
- * that requires the Fetch-handler signature this project doesn't use), so a
- * detached promise here could get killed before it finishes. Failures don't
- * block saving the credentials — the user's own "Sync inbox" button is the
- * fallback if this pre-fetch fails.
- */
-async function syncInboxNow(db: Client, userId: number, gmailEmail: string, gmailAppPassword: string): Promise<{ synced: number; total: number } | null> {
-  const mailCfg = {
-    user: gmailEmail,
-    appPassword: gmailAppPassword,
-    imapHost: process.env.GMAIL_IMAP_HOST ?? "imap.gmail.com",
-    smtpHost: process.env.GMAIL_SMTP_HOST ?? "smtp.gmail.com",
-  };
-  try {
-    return await syncUserInbox(db, userId, mailCfg);
-  } catch (err) {
-    console.error(`[admin] first-sync failed for user ${userId}:`, err);
-    return null;
-  }
-}
 
 function shapeUser(r: {
   id: number; name: string | null; email: string; is_admin: number; disabled: number; gmail_email: string | null; created_at: string;
@@ -98,14 +71,7 @@ router.post("/users", async (c) => {
       await db.execute({ sql: `SELECT ${USER_COLUMNS} FROM users WHERE id = ?`, args: [userId] })
     ).rows[0] as unknown as { id: number; name: string | null; email: string; is_admin: number; disabled: number; gmail_email: string | null; created_at: string };
 
-    // Gmail credentials supplied at creation time — pull in their existing
-    // mail right away instead of waiting for their first Email Studio visit.
-    // Awaited (see syncInboxNow) so it reliably finishes on serverless.
-    const gmailEmail = data.gmail_email?.trim();
-    const gmailAppPassword = data.gmail_app_password?.trim();
-    const sync = gmailEmail && gmailAppPassword ? await syncInboxNow(db, userId, gmailEmail, gmailAppPassword) : null;
-
-    return c.json({ ...shapeUser(user), first_sync: sync });
+    return c.json(shapeUser(user));
   } catch (e) {
     return c.json({ error: (e as Error).message }, 400);
   }
@@ -132,10 +98,7 @@ router.post("/users/:id/email-credentials", async (c) => {
         sql: "UPDATE users SET gmail_email = ?, gmail_app_password = ? WHERE id = ?",
         args: [email, appPassword, id],
       });
-      // A real app password was just supplied (new account, or replacing an
-      // old one) — pull in their inbox right away. Awaited (see syncInboxNow).
-      const sync = await syncInboxNow(db, id, email, appPassword);
-      return c.json({ success: true, first_sync: sync });
+      return c.json({ success: true });
     } else {
       await db.execute({ sql: "UPDATE users SET gmail_email = ? WHERE id = ?", args: [email, id] });
     }

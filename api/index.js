@@ -277,10 +277,8 @@ async function initDb(c) {
   await c.execute(`UPDATE chat_messages SET user_id = 1 WHERE user_id IS NULL`);
   await c.execute(`
     INSERT OR IGNORE INTO events (id, lead_id, channel, action, summary, source_ref, created_at)
-    SELECT 'evt-' || id, lead_id, 'email',
-           CASE WHEN direction = 'inbound' THEN 'received' ELSE COALESCE(status, 'sent') END,
-           subject, id, created_at
-    FROM email_messages
+    SELECT 'evt-' || id, lead_id, 'email', COALESCE(status, 'sent'), subject, id, created_at
+    FROM email_messages WHERE COALESCE(direction, 'outbound') = 'outbound'
   `);
   await c.execute(`
     INSERT OR IGNORE INTO events (id, lead_id, channel, action, summary, source_ref, created_at)
@@ -742,8 +740,6 @@ import { z as z3 } from "zod";
 
 // src/lib/mailer.ts
 import nodemailer from "nodemailer";
-import { ImapFlow } from "imapflow";
-import { simpleParser } from "mailparser";
 function mailerConfig() {
   const user = process.env.GMAIL_USER;
   const appPassword = process.env.GMAIL_APP_PASSWORD;
@@ -781,104 +777,6 @@ async function sendMessage(args, cfg = mailerConfig()) {
     ...args.attachments && args.attachments.length ? { attachments: args.attachments } : {}
   });
   return { message_id: info.messageId ?? null, thread_id: null };
-}
-async function withImap(fn, cfg = mailerConfig()) {
-  const client2 = new ImapFlow({
-    host: cfg.imapHost,
-    port: 993,
-    secure: true,
-    auth: { user: cfg.user, pass: cfg.appPassword },
-    logger: false
-  });
-  await client2.connect();
-  try {
-    return await fn(client2);
-  } finally {
-    await client2.logout().catch(() => client2.close());
-  }
-}
-async function listMessages(args = {}, cfg = mailerConfig()) {
-  const limit = args.limit ?? 50;
-  const messages = await withImap(async (client2) => {
-    const out = [];
-    for (const mailbox of ["INBOX", "[Gmail]/Sent Mail"]) {
-      let lock;
-      try {
-        lock = await client2.getMailboxLock(mailbox);
-      } catch {
-        continue;
-      }
-      try {
-        const box = client2.mailbox;
-        if (!box || typeof box === "boolean") continue;
-        const total = box.exists;
-        if (!total) continue;
-        const from = Math.max(1, total - limit + 1);
-        for await (const msg of client2.fetch(`${from}:${total}`, { envelope: true, uid: true })) {
-          out.push(toEnvelopeMessage(msg.envelope, msg.uid, mailbox, cfg.user));
-        }
-      } finally {
-        lock.release();
-      }
-    }
-    out.sort((a, b) => (b.timestamp ?? "").localeCompare(a.timestamp ?? ""));
-    return out.slice(0, limit);
-  }, cfg);
-  return { messages };
-}
-async function getMessage(messageId, cfg = mailerConfig()) {
-  const parts = messageId.split(":");
-  const [mailbox, uidStr] = parts.length >= 3 ? parts.slice(1) : parts;
-  const uid = Number(uidStr);
-  return withImap(async (client2) => {
-    const lock = await client2.getMailboxLock(mailbox);
-    try {
-      for await (const msg of client2.fetch({ uid }, { source: true, uid: true }, { uid: true })) {
-        if (!msg.source) continue;
-        const parsed = await simpleParser(msg.source);
-        return toFetchedMessage(parsed, msg.uid, mailbox, cfg.user);
-      }
-      throw new Error(`Message ${messageId} not found`);
-    } finally {
-      lock.release();
-    }
-  }, cfg);
-}
-function toEnvelopeMessage(envelope, uid, mailbox, account) {
-  const isSent = mailbox.toLowerCase().includes("sent");
-  const addr = (list) => list && list.length ? list.map((a) => a.name ? `${a.name} <${a.address}>` : a.address).join(", ") : null;
-  return {
-    message_id: `${account}:${mailbox}:${uid}`,
-    thread_id: null,
-    from: addr(envelope?.from),
-    to: addr(envelope?.to),
-    subject: envelope?.subject ?? null,
-    text: null,
-    html: null,
-    extracted_text: null,
-    extracted_html: null,
-    timestamp: envelope?.date ? envelope.date.toISOString() : null,
-    labels: isSent ? ["sent"] : []
-  };
-}
-function toFetchedMessage(parsed, uid, mailbox, account) {
-  const isSent = mailbox.toLowerCase().includes("sent");
-  return {
-    // Prefixed with the account so the same IMAP uid in two different users'
-    // mailboxes (both commonly start counting from 1) never collides in the
-    // agentmail_message_id dedupe check on sync.
-    message_id: `${account}:${mailbox}:${uid}`,
-    thread_id: parsed.headers.get("thread-index") ?? null,
-    from: parsed.from?.text ?? null,
-    to: Array.isArray(parsed.to) ? parsed.to.map((t) => t.text).join(", ") : parsed.to?.text ?? null,
-    subject: parsed.subject ?? null,
-    text: parsed.text ?? null,
-    html: typeof parsed.html === "string" ? parsed.html : null,
-    extracted_text: parsed.text ?? null,
-    extracted_html: typeof parsed.html === "string" ? parsed.html : null,
-    timestamp: parsed.date ? parsed.date.toISOString() : null,
-    labels: isSent ? ["sent"] : []
-  };
 }
 
 // src/lib/events.ts
@@ -919,79 +817,6 @@ async function insertEvent(db, e) {
     });
   }
   return id;
-}
-
-// src/lib/email-sync.ts
-function extractEmail(from) {
-  if (!from) return null;
-  const s = String(from).trim();
-  const m = s.match(/<([^<>]+)>/);
-  return (m ? m[1] : s) || null;
-}
-function extractName(from) {
-  if (!from) return null;
-  const m = String(from).trim().match(/^(.*?)\s*<[^<>]+>$/);
-  return m && m[1].trim() ? m[1].trim() : null;
-}
-function stripHtml(html) {
-  if (!html) return null;
-  return String(html).replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").replace(/\s+/g, " ").trim().slice(0, 2e3);
-}
-async function syncUserInbox(db, userId, mailCfg) {
-  const res = await listMessages({ limit: 50 }, mailCfg);
-  const msgs = Array.isArray(res.messages) ? res.messages : [];
-  let synced = 0;
-  for (const m of msgs) {
-    if (!m.message_id) continue;
-    if (Array.isArray(m.labels) && m.labels.includes("sent")) continue;
-    const existing = (await db.execute({ sql: "SELECT id FROM email_messages WHERE agentmail_message_id = ?", args: [m.message_id] })).rows[0];
-    if (existing) continue;
-    let full = m;
-    try {
-      full = await getMessage(m.message_id, mailCfg);
-    } catch {
-    }
-    const fromEmail = extractEmail(full.from);
-    const toEmail = Array.isArray(full.to) ? full.to[0] ?? null : typeof full.to === "string" ? full.to : null;
-    const body = full.extracted_text ?? full.text ?? stripHtml(full.extracted_html ?? full.html);
-    let leadId = null;
-    if (fromEmail) {
-      const lead = (await db.execute({ sql: "SELECT id FROM leads WHERE email = ? AND user_id = ?", args: [fromEmail, userId] })).rows[0];
-      if (lead) {
-        leadId = lead.id;
-      } else {
-        const now = (/* @__PURE__ */ new Date()).toISOString();
-        const newId = crypto.randomUUID();
-        const name = extractName(full.from) ?? fromEmail;
-        await db.execute({
-          sql: "INSERT INTO leads (id, user_id, name, email, source, status, score, last_activity, created_at) VALUES (?, ?, ?, ?, 'inbound email', 'new', ?, ?, ?)",
-          args: [newId, userId, name, fromEmail, computeLeadScore({ email: fromEmail, name }), now, now]
-        });
-        leadId = newId;
-      }
-    }
-    const emailRowId = crypto.randomUUID();
-    const emailCreatedAt = full.timestamp ?? (/* @__PURE__ */ new Date()).toISOString();
-    await db.execute({
-      sql: "INSERT INTO email_messages (id, lead_id, subject, body, direction, status, from_email, to_email, agentmail_message_id, agentmail_thread_id, created_at) VALUES (?, ?, ?, ?, 'inbound', 'received', ?, ?, ?, ?, ?)",
-      args: [emailRowId, leadId, full.subject ?? null, body, fromEmail, toEmail, full.message_id, full.thread_id ?? null, emailCreatedAt]
-    });
-    await insertEvent(db, {
-      lead_id: leadId,
-      channel: "email",
-      type: "email",
-      direction: "inbound",
-      handled_by: "unhandled",
-      action: "received",
-      summary: full.subject ?? "(no subject)",
-      content: body,
-      source_ref: emailRowId,
-      metadata: { from: fromEmail, message_id: full.message_id },
-      created_at: emailCreatedAt
-    });
-    synced++;
-  }
-  return { synced, total: msgs.length };
 }
 
 // src/lib/whatsapp.ts
@@ -1327,7 +1152,8 @@ router3.get("/emails", async (c) => {
   if (!user) return c.json({ error: "Unauthorized" }, 401);
   const rows = (await (await getDb()).execute({
     sql: `SELECT m.* FROM email_messages m JOIN leads l ON l.id = m.lead_id
-          WHERE l.user_id = ? ORDER BY m.created_at DESC LIMIT 100`,
+          WHERE l.user_id = ? AND COALESCE(m.direction, 'outbound') = 'outbound'
+          ORDER BY m.created_at DESC LIMIT 100`,
     args: [user.id]
   })).rows;
   return c.json(rows);
@@ -1428,23 +1254,6 @@ router3.post("/emails/send", async (c) => {
     });
     const updated = (await db.execute({ sql: "SELECT * FROM email_messages WHERE id = ?", args: [id] })).rows[0];
     return c.json(updated);
-  } catch (e) {
-    return c.json({ error: e.message }, 502);
-  }
-});
-router3.post("/emails/sync", async (c) => {
-  const user = await authenticate(c);
-  if (!user) return c.json({ error: "Unauthorized" }, 401);
-  const db = await getDb();
-  let mailCfg;
-  try {
-    mailCfg = await userMailerConfig(db, user.id);
-  } catch (e) {
-    return c.json({ error: e.message }, 400);
-  }
-  try {
-    const result = await syncUserInbox(db, user.id, mailCfg);
-    return c.json(result);
   } catch (e) {
     return c.json({ error: e.message }, 502);
   }
@@ -2183,20 +1992,6 @@ var updateEmailCredsSchema = z6.object({
 });
 var resetPasswordSchema = z6.object({ password: z6.string().min(6) });
 var USER_COLUMNS = "id, name, email, is_admin, disabled, gmail_email, created_at";
-async function syncInboxNow(db, userId, gmailEmail, gmailAppPassword) {
-  const mailCfg = {
-    user: gmailEmail,
-    appPassword: gmailAppPassword,
-    imapHost: process.env.GMAIL_IMAP_HOST ?? "imap.gmail.com",
-    smtpHost: process.env.GMAIL_SMTP_HOST ?? "smtp.gmail.com"
-  };
-  try {
-    return await syncUserInbox(db, userId, mailCfg);
-  } catch (err) {
-    console.error(`[admin] first-sync failed for user ${userId}:`, err);
-    return null;
-  }
-}
 function shapeUser(r) {
   return { ...r, is_admin: !!r.is_admin, disabled: !!r.disabled, has_gmail: !!r.gmail_email };
 }
@@ -2226,10 +2021,7 @@ router7.post("/users", async (c) => {
     });
     const userId = Number(result.lastInsertRowid);
     const user = (await db.execute({ sql: `SELECT ${USER_COLUMNS} FROM users WHERE id = ?`, args: [userId] })).rows[0];
-    const gmailEmail = data.gmail_email?.trim();
-    const gmailAppPassword = data.gmail_app_password?.trim();
-    const sync = gmailEmail && gmailAppPassword ? await syncInboxNow(db, userId, gmailEmail, gmailAppPassword) : null;
-    return c.json({ ...shapeUser(user), first_sync: sync });
+    return c.json(shapeUser(user));
   } catch (e) {
     return c.json({ error: e.message }, 400);
   }
@@ -2251,8 +2043,7 @@ router7.post("/users/:id/email-credentials", async (c) => {
         sql: "UPDATE users SET gmail_email = ?, gmail_app_password = ? WHERE id = ?",
         args: [email, appPassword, id]
       });
-      const sync = await syncInboxNow(db, id, email, appPassword);
-      return c.json({ success: true, first_sync: sync });
+      return c.json({ success: true });
     } else {
       await db.execute({ sql: "UPDATE users SET gmail_email = ? WHERE id = ?", args: [email, id] });
     }

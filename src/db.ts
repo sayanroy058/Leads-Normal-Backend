@@ -248,12 +248,11 @@ async function initDb(c: Client) {
 
   // Backfill events from pre-existing channel rows so the activity feed has
   // history. Idempotent: INSERT OR IGNORE + unique (channel, source_ref).
+  // Inbound/received email rows are skipped — the inbox feature was removed.
   await c.execute(`
     INSERT OR IGNORE INTO events (id, lead_id, channel, action, summary, source_ref, created_at)
-    SELECT 'evt-' || id, lead_id, 'email',
-           CASE WHEN direction = 'inbound' THEN 'received' ELSE COALESCE(status, 'sent') END,
-           subject, id, created_at
-    FROM email_messages
+    SELECT 'evt-' || id, lead_id, 'email', COALESCE(status, 'sent'), subject, id, created_at
+    FROM email_messages WHERE COALESCE(direction, 'outbound') = 'outbound'
   `);
   await c.execute(`
     INSERT OR IGNORE INTO events (id, lead_id, channel, action, summary, source_ref, created_at)

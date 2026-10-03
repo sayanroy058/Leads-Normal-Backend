@@ -4,7 +4,6 @@ import type { Client, InStatement } from "@libsql/client";
 import { getDb } from "../db";
 import { authenticate } from "../middleware/auth";
 import { sendMessage, type MailerConfig } from "../lib/mailer";
-import { syncUserInbox } from "../lib/email-sync";
 import { insertEvent } from "../lib/events";
 import { computeLeadScore } from "./leads";
 import { sendText, sendMedia, whatsappConfig } from "../lib/whatsapp";
@@ -122,12 +121,15 @@ router.post("/chat", async (c) => {
 });
 
 // ---- Email ----
+// Outbound only — the inbox/received-mail feature was removed, so inbound rows
+// are neither shown nor synced anymore (see /emails/sync, also removed).
 router.get("/emails", async (c) => {
   const user = await authenticate(c);
   if (!user) return c.json({ error: "Unauthorized" }, 401);
   const rows = (await (await getDb()).execute({
     sql: `SELECT m.* FROM email_messages m JOIN leads l ON l.id = m.lead_id
-          WHERE l.user_id = ? ORDER BY m.created_at DESC LIMIT 100`,
+          WHERE l.user_id = ? AND COALESCE(m.direction, 'outbound') = 'outbound'
+          ORDER BY m.created_at DESC LIMIT 100`,
     args: [user.id],
   })).rows;
   return c.json(rows);
@@ -232,25 +234,6 @@ router.post("/emails/send", async (c) => {
     });
     const updated = (await db.execute({ sql: "SELECT * FROM email_messages WHERE id = ?", args: [id] })).rows[0];
     return c.json(updated);
-  } catch (e) {
-    return c.json({ error: (e as Error).message }, 502);
-  }
-});
-
-// Pull the latest inbound mail from this user's own Gmail inbox into email_messages.
-router.post("/emails/sync", async (c) => {
-  const user = await authenticate(c);
-  if (!user) return c.json({ error: "Unauthorized" }, 401);
-  const db = await getDb();
-  let mailCfg: MailerConfig;
-  try {
-    mailCfg = await userMailerConfig(db, user.id);
-  } catch (e) {
-    return c.json({ error: (e as Error).message }, 400);
-  }
-  try {
-    const result = await syncUserInbox(db, user.id, mailCfg);
-    return c.json(result);
   } catch (e) {
     return c.json({ error: (e as Error).message }, 502);
   }
