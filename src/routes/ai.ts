@@ -8,6 +8,7 @@ import { getDb } from "../db";
 import { sendMessage, type MailerConfig } from "../lib/mailer";
 import { sendText } from "../lib/whatsapp";
 import { insertEvent } from "../lib/events";
+import { getKnowledgeContext } from "../lib/knowledge";
 
 /** This user's own Gmail credentials (set by an admin), falling back to the
  * global env vars for accounts with none configured. */
@@ -182,13 +183,16 @@ router.post("/chat", async (c) => {
     .object({ question: z.string(), leads: z.array(z.any()), history: historySchema.optional() })
     .parse(await c.req.json());
   const ai = gateway();
+  // Ground the assistant in the user's own business knowledge base, when set.
+  const kbContext = await getKnowledgeContext(await getDb(), authedUser.id, question);
   let text: string;
   try {
     const res = await generateText({
       model: ai(MODEL),
       system:
         "You are an assistant for a lead-management CRM (prospects, customers, deals). Answer ONLY using the provided leads data. Be concise. Cite leads as [lead:FULL_ID]. Do not invent leads or their data, and never substitute a different lead when the one being discussed lacks a field — say that field is missing instead. The conversation may reference a lead named earlier in the thread — use that context to resolve follow-up questions (e.g. \"his email\" or \"show me his number\" refers to the lead just discussed, not a different one). " +
-        "You have two real tools: send_email and send_whatsapp. Use them ONLY when the user explicitly asks you to send an email or WhatsApp message to a specific lead. Compose the content yourself from the lead's requirements. After a tool succeeds, confirm briefly what was sent and to whom. If a tool reports an error, tell the user what happened and what they can do (e.g. add the missing email/phone, or send from Email Studio).",
+        "You have two real tools: send_email and send_whatsapp. Use them ONLY when the user explicitly asks you to send an email or WhatsApp message to a specific lead. Compose the content yourself from the lead's requirements. After a tool succeeds, confirm briefly what was sent and to whom. If a tool reports an error, tell the user what happened and what they can do (e.g. add the missing email/phone, or send from Email Studio)." +
+        (kbContext ? `\n\nThe business has provided the following knowledge base — use it to answer questions about the business itself (products, services, hours, location, policies, FAQs). Do not invent facts beyond it:\n${kbContext}` : ""),
       messages: [
         { role: "user", content: `Leads (${leads.length}):\n${leadsBlock(leads as LeadCtx[])}` },
         ...(history ?? []),
@@ -212,21 +216,25 @@ router.post("/chat", async (c) => {
 });
 
 router.post("/email", async (c) => {
-  if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
+  const user = await authenticate(c);
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
   const { lead, tone, goal, senderName } = z.object({ lead: z.any(), tone: z.string(), goal: z.string(), senderName: z.string().optional() }).parse(await c.req.json());
   const ai = gateway();
+  const kbContext = await getKnowledgeContext(await getDb(), user.id, `${goal} ${lead?.name ?? ""} ${lead?.interest ?? ""}`);
   const { text } = await generateText({
-    model: ai(MODEL), system: `You write short, high-converting sales and outreach emails for a small business (introductions, proposals, follow-ups, check-ins). Reply as strict JSON: {"subject":"...","body":"..."}. Keep body under 110 words. Sign as ${senderName ?? "Jordan"}.`, prompt: `Tone: ${tone}\nGoal: ${goal}\nLead: ${JSON.stringify(lead)}`,
+    model: ai(MODEL), system: `You write short, high-converting sales and outreach emails for a small business (introductions, proposals, follow-ups, check-ins). Reply as strict JSON: {"subject":"...","body":"..."}. Keep body under 110 words. Sign as ${senderName ?? "Jordan"}.${kbContext ? ` Use this knowledge base for accurate facts about the business; do not invent details:\n${kbContext}` : ""}`, prompt: `Tone: ${tone}\nGoal: ${goal}\nLead: ${JSON.stringify(lead)}`,
   });
   try { const j = JSON.parse(text.replace(/```json|```/g, "").trim()); return c.json({ subject: j.subject ?? "", body: j.body ?? "" }); } catch { return c.json({ subject: "", body: text }); }
 });
 
 router.post("/whatsapp", async (c) => {
-  if (!(await authenticate(c))) return c.json({ error: "Unauthorized" }, 401);
+  const user = await authenticate(c);
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
   const { lead, intent } = z.object({ lead: z.any(), intent: z.string() }).parse(await c.req.json());
   const ai = gateway();
+  const kbContext = await getKnowledgeContext(await getDb(), user.id, `${intent} ${lead?.name ?? ""} ${lead?.interest ?? ""}`);
   const { text } = await generateText({
-    model: ai(MODEL), system: "Write a friendly, concise follow-up WhatsApp message (1-3 sentences, max 280 chars) — e.g. appointment reminders, quick check-ins, or next-step updates. Use the lead's first name. One emoji max. Return ONLY the message body.", prompt: `Intent: ${intent}\nLead: ${JSON.stringify(lead)}`,
+    model: ai(MODEL), system: `Write a friendly, concise follow-up WhatsApp message (1-3 sentences, max 280 chars) — e.g. appointment reminders, quick check-ins, or next-step updates. Use the lead's first name. One emoji max. Return ONLY the message body.${kbContext ? ` Use these business details for accuracy; do not invent facts:\n${kbContext}` : ""}`, prompt: `Intent: ${intent}\nLead: ${JSON.stringify(lead)}`,
   });
   return c.json({ body: text.trim().replace(/^"|"$/g, "") });
 });

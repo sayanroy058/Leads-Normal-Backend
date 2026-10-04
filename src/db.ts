@@ -154,6 +154,90 @@ const TABLE_DDL = [
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_events_source ON events(channel, source_ref) WHERE source_ref IS NOT NULL`,
   `CREATE INDEX IF NOT EXISTS idx_leads_email ON leads(email)`,
   `CREATE INDEX IF NOT EXISTS idx_leads_phone ON leads(phone)`,
+
+  // ---- Per-user Knowledge Base --------------------------------------------
+  // Each user has one published business profile that doubles as the grounding
+  // source for their AI features. Strictly tenant-scoped (user_id).
+  `CREATE TABLE IF NOT EXISTS knowledge_bases (
+    id TEXT PRIMARY KEY,
+    user_id INTEGER UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+    slug TEXT UNIQUE,
+    title TEXT,
+    tagline TEXT,
+    description TEXT,
+    contact_email TEXT,
+    contact_phone TEXT,
+    contact_website TEXT,
+    contact_address TEXT,
+    status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','published')),
+    published_at TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT
+  )`,
+  `CREATE TABLE IF NOT EXISTS kb_sections (
+    id TEXT PRIMARY KEY,
+    kb_id TEXT NOT NULL,
+    kind TEXT DEFAULT 'custom',
+    title TEXT,
+    body TEXT,
+    position INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (kb_id) REFERENCES knowledge_bases(id) ON DELETE CASCADE
+  )`,
+  `CREATE TABLE IF NOT EXISTS kb_entries (
+    id TEXT PRIMARY KEY,
+    kb_id TEXT NOT NULL,
+    question TEXT NOT NULL,
+    answer TEXT NOT NULL,
+    tags TEXT,
+    position INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (kb_id) REFERENCES knowledge_bases(id) ON DELETE CASCADE
+  )`,
+  `CREATE TABLE IF NOT EXISTS kb_sources (
+    id TEXT PRIMARY KEY,
+    kb_id TEXT NOT NULL,
+    type TEXT NOT NULL DEFAULT 'file' CHECK(type IN ('file','url')),
+    name TEXT,
+    status TEXT DEFAULT 'ready',
+    fetched_at TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (kb_id) REFERENCES knowledge_bases(id) ON DELETE CASCADE
+  )`,
+  `CREATE TABLE IF NOT EXISTS kb_chunks (
+    id TEXT PRIMARY KEY,
+    kb_id TEXT NOT NULL,
+    source_id TEXT,
+    text TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (kb_id) REFERENCES knowledge_bases(id) ON DELETE CASCADE,
+    FOREIGN KEY (source_id) REFERENCES kb_sources(id) ON DELETE CASCADE
+  )`,
+  `CREATE TABLE IF NOT EXISTS kb_crawl_jobs (
+    id TEXT PRIMARY KEY,
+    kb_id TEXT NOT NULL,
+    source_id TEXT,
+    source_url TEXT NOT NULL,
+    host TEXT,
+    limit_pages INTEGER DEFAULT 100,
+    max_depth INTEGER DEFAULT 3,
+    include_paths TEXT,
+    exclude_paths TEXT,
+    status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','paused','done','failed','cancelled')),
+    pages_found INTEGER DEFAULT 0,
+    pages_done INTEGER DEFAULT 0,
+    frontier TEXT,
+    visited TEXT,
+    error TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT,
+    FOREIGN KEY (kb_id) REFERENCES knowledge_bases(id) ON DELETE CASCADE
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_kb_sections ON kb_sections(kb_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_kb_entries ON kb_entries(kb_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_kb_sources ON kb_sources(kb_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_kb_chunks ON kb_chunks(kb_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_kb_crawl_jobs ON kb_crawl_jobs(kb_id)`,
 ];
 
 // Column migrations for tables created before these columns existed.
@@ -206,6 +290,21 @@ const TENANCY_MIGRATIONS = [
   `ALTER TABLE users ADD COLUMN gmail_app_password TEXT`,
 ];
 
+// Plivo Agentflow (AI voice agent) run tracking. `phlo_id` is the flow-run id
+// Plivo returns when the trigger accepts a request; the remaining columns
+// capture what we sent and what the agent reported back.
+const CALL_LOG_MIGRATIONS = [
+  `ALTER TABLE call_logs ADD COLUMN provider TEXT`,
+  `ALTER TABLE call_logs ADD COLUMN phlo_id TEXT`,
+  `ALTER TABLE call_logs ADD COLUMN prompt_used TEXT`,
+  `ALTER TABLE call_logs ADD COLUMN from_number TEXT`,
+  `ALTER TABLE call_logs ADD COLUMN to_number TEXT`,
+  // Plivo returns a *static* flow UUID as phlo_id (verified: identical across
+  // runs), so it cannot identify a single call. api_id is unique per run and
+  // is the only reliable handle for matching Agentflow callbacks.
+  `ALTER TABLE call_logs ADD COLUMN plivo_api_id TEXT`,
+];
+
 // Hardcoded demo account so login works out of the box.
 //   email:    testuser@gmail.com
 //   password: Str0ng!P9a  (10 chars: upper + lower + digit + symbol)
@@ -229,7 +328,7 @@ async function initDb(c: Client) {
 
   // Column migrations run individually — ALTER TABLE cannot be batched with
   // a guaranteed outcome, and duplicate-column errors are expected once applied.
-  for (const sql of [...EMAIL_MESSAGE_MIGRATIONS, ...WHATSAPP_MESSAGE_MIGRATIONS, ...ATTACHMENT_MIGRATIONS, ...USER_ACCESS_MIGRATIONS, ...TENANCY_MIGRATIONS]) {
+  for (const sql of [...EMAIL_MESSAGE_MIGRATIONS, ...WHATSAPP_MESSAGE_MIGRATIONS, ...ATTACHMENT_MIGRATIONS, ...USER_ACCESS_MIGRATIONS, ...TENANCY_MIGRATIONS, ...CALL_LOG_MIGRATIONS]) {
     try {
       await c.execute(sql);
     } catch {
@@ -267,6 +366,9 @@ async function initDb(c: Client) {
     FROM call_logs
   `);
 
+  // Unique index so the callback webhook can match a run by its api_id.
+  await c.execute(`CREATE UNIQUE INDEX IF NOT EXISTS idx_call_logs_plivo_api ON call_logs(plivo_api_id) WHERE plivo_api_id IS NOT NULL`);
+
   // Generic pipeline: ensure the leads schema matches the pipeline stages
   // (new → contacted → qualified → meeting → proposal → closed → lost) and the
   // generic columns. SQLite cannot ALTER a CHECK constraint, so this rebuilds
@@ -275,6 +377,16 @@ async function initDb(c: Client) {
 
   // Phase 0 — unify onto the Conversation/Event model (idempotent).
   await migrateEventsToConversations(c);
+
+  // Full-text index for knowledge-base retrieval. Standalone (not
+  // external-content) so it works regardless of how kb_chunks rows are written.
+  // Best-effort: a build without FTS5 simply falls back to LIKE in
+  // lib/knowledge.ts, so a failure here must not break startup.
+  try {
+    await c.execute(`CREATE VIRTUAL TABLE IF NOT EXISTS kb_chunks_fts USING fts5(chunk_id UNINDEXED, kb_id UNINDEXED, text)`);
+  } catch {
+    // FTS5 unavailable on this database — LIKE fallback handles retrieval.
+  }
 }
 
 /**

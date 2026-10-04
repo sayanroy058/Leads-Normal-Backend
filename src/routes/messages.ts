@@ -4,7 +4,9 @@ import type { Client, InStatement } from "@libsql/client";
 import { getDb } from "../db";
 import { authenticate } from "../middleware/auth";
 import { sendMessage, type MailerConfig } from "../lib/mailer";
+import { buildAgentBrief, buildTriggerPayload, triggerAgentflow, normalizePhone, type DialResult } from "../lib/plivo-agentflow";
 import { insertEvent } from "../lib/events";
+import { getKnowledgeContext } from "../lib/knowledge";
 import { computeLeadScore } from "./leads";
 import { sendText, sendMedia, whatsappConfig } from "../lib/whatsapp";
 
@@ -440,6 +442,81 @@ router.post("/calls/status", async (c) => {
   const cl = (await db.execute({ sql: "SELECT lead_id FROM call_logs WHERE id = ?", args: [d.id] })).rows[0] as unknown as { lead_id: string | null } | undefined;
   await insertEvent(db, { lead_id: cl?.lead_id ?? null, channel: "call", action: d.outcome ?? d.status ?? "updated", source_ref: d.id });
   return c.json({ success: true });
+});
+
+// Place a real outbound call to a lead via the Plivo AI voice agent.
+// The agent speaks from the lead's own recorded details/requirements.
+router.post("/calls/dial", async (c) => {
+  const user = await authenticate(c);
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  try {
+    const data = z.object({ lead_id: z.string(), goal: z.string().optional() }).parse(await c.req.json());
+    const db = await getDb();
+    const lead = (
+      await db.execute({ sql: "SELECT * FROM leads WHERE id = ? AND user_id = ?", args: [data.lead_id, user.id] })
+    ).rows[0] as unknown as {
+      id: string; name: string; phone: string | null; company: string | null; city: string | null;
+      notes: string | null; interest: string | null; category: string | null;
+      budget_min: number | null; budget_max: number | null; region: string | null;
+      urgency: string | null; value: number | null; status: string; score: number;
+    } | undefined;
+    if (!lead) return c.json({ error: "Lead not found" }, 404);
+    if (!lead.phone) return c.json({ error: `${lead.name} has no phone number — add one before calling.` }, 400);
+
+    // Plivo needs strict E.164 (e.g. +917014607737); saved numbers are often
+    // human-formatted ("+91 70146 07737"), which the telco would reject.
+    const toNumber = normalizePhone(lead.phone);
+    if (!toNumber) {
+      return c.json({ error: `${lead.name}'s number "${lead.phone}" isn't a usable international format. Save it as +countrycode followed by digits, e.g. +91 70146 07737.` }, 400);
+    }
+
+    // Ground the voice agent in the user's business knowledge base too, so it
+    // can answer questions about the business itself, not just the lead.
+    const kbContext = await getKnowledgeContext(db, user.id, [lead.interest, lead.category, data.goal].filter(Boolean).join(" "));
+    const brief = buildAgentBrief(lead, data.goal) + (kbContext ? `\n\nBusiness knowledge base (answer questions about the business from this — do not invent facts):\n${kbContext}` : "");
+    const id = crypto.randomUUID();
+    const now = new Date().toISOString();
+
+    // Fire the flow first: if Plivo rejects the request we must not leave a
+    // misleading "queued" call behind.
+    let run: DialResult;
+    try {
+      run = await triggerAgentflow(
+        buildTriggerPayload({
+          leadId: lead.id, callId: id, toNumber, leadName: lead.name, brief,
+          company: lead.company, interest: lead.interest, goal: data.goal ?? null,
+        })
+      );
+    } catch (e) {
+      // Record the failure so the operator can see what happened in the board.
+      await db.batch([
+        {
+          sql: "INSERT INTO call_logs (id, lead_id, goal, status, outcome, provider, from_number, to_number, created_at) VALUES (?, ?, ?, 'failed', ?, 'plivo', NULL, ?, ?)",
+          args: [id, lead.id, data.goal ?? null, (e as Error).message.slice(0, 500), toNumber, now],
+        },
+        {
+          sql: "INSERT INTO events (id, lead_id, channel, action, summary, source_ref, created_at) VALUES (?, ?, 'call', 'failed', ?, ?, ?)",
+          args: [crypto.randomUUID(), lead.id, `Call to ${lead.name} failed to start`, id, now],
+        },
+      ], "write");
+      return c.json({ error: (e as Error).message }, 502);
+    }
+
+    await db.batch([
+      {
+        sql: "INSERT INTO call_logs (id, lead_id, goal, status, provider, phlo_id, plivo_api_id, prompt_used, to_number, started_at, created_at) VALUES (?, ?, ?, 'in_progress', 'plivo', ?, ?, ?, ?, ?, ?)",
+        args: [id, lead.id, data.goal ?? null, run.phlo_id, run.api_id, brief, toNumber, now, now],
+      },
+      {
+        sql: "INSERT INTO events (id, lead_id, channel, action, summary, source_ref, created_at) VALUES (?, ?, 'call', 'initiated', ?, ?, ?)",
+        args: [crypto.randomUUID(), lead.id, `AI agent calling ${lead.name} about ${lead.interest ?? "their enquiry"}`, id, now],
+      },
+    ], "write");
+
+    return c.json({ success: true, call_id: id, phlo_id: run.phlo_id, message: run.message, brief, to_number: toNumber });
+  } catch (e) {
+    return c.json({ error: (e as Error).message }, 400);
+  }
 });
 
 // ---- Appointments ----

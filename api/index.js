@@ -1,6 +1,6 @@
 // src/index.ts
 import { serve } from "@hono/node-server";
-import { Hono as Hono8 } from "hono";
+import { Hono as Hono11 } from "hono";
 import { cors } from "hono/cors";
 
 // src/routes/auth.ts
@@ -220,7 +220,90 @@ var TABLE_DDL = [
   )`,
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_events_source ON events(channel, source_ref) WHERE source_ref IS NOT NULL`,
   `CREATE INDEX IF NOT EXISTS idx_leads_email ON leads(email)`,
-  `CREATE INDEX IF NOT EXISTS idx_leads_phone ON leads(phone)`
+  `CREATE INDEX IF NOT EXISTS idx_leads_phone ON leads(phone)`,
+  // ---- Per-user Knowledge Base --------------------------------------------
+  // Each user has one published business profile that doubles as the grounding
+  // source for their AI features. Strictly tenant-scoped (user_id).
+  `CREATE TABLE IF NOT EXISTS knowledge_bases (
+    id TEXT PRIMARY KEY,
+    user_id INTEGER UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+    slug TEXT UNIQUE,
+    title TEXT,
+    tagline TEXT,
+    description TEXT,
+    contact_email TEXT,
+    contact_phone TEXT,
+    contact_website TEXT,
+    contact_address TEXT,
+    status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','published')),
+    published_at TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT
+  )`,
+  `CREATE TABLE IF NOT EXISTS kb_sections (
+    id TEXT PRIMARY KEY,
+    kb_id TEXT NOT NULL,
+    kind TEXT DEFAULT 'custom',
+    title TEXT,
+    body TEXT,
+    position INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (kb_id) REFERENCES knowledge_bases(id) ON DELETE CASCADE
+  )`,
+  `CREATE TABLE IF NOT EXISTS kb_entries (
+    id TEXT PRIMARY KEY,
+    kb_id TEXT NOT NULL,
+    question TEXT NOT NULL,
+    answer TEXT NOT NULL,
+    tags TEXT,
+    position INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (kb_id) REFERENCES knowledge_bases(id) ON DELETE CASCADE
+  )`,
+  `CREATE TABLE IF NOT EXISTS kb_sources (
+    id TEXT PRIMARY KEY,
+    kb_id TEXT NOT NULL,
+    type TEXT NOT NULL DEFAULT 'file' CHECK(type IN ('file','url')),
+    name TEXT,
+    status TEXT DEFAULT 'ready',
+    fetched_at TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (kb_id) REFERENCES knowledge_bases(id) ON DELETE CASCADE
+  )`,
+  `CREATE TABLE IF NOT EXISTS kb_chunks (
+    id TEXT PRIMARY KEY,
+    kb_id TEXT NOT NULL,
+    source_id TEXT,
+    text TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (kb_id) REFERENCES knowledge_bases(id) ON DELETE CASCADE,
+    FOREIGN KEY (source_id) REFERENCES kb_sources(id) ON DELETE CASCADE
+  )`,
+  `CREATE TABLE IF NOT EXISTS kb_crawl_jobs (
+    id TEXT PRIMARY KEY,
+    kb_id TEXT NOT NULL,
+    source_id TEXT,
+    source_url TEXT NOT NULL,
+    host TEXT,
+    limit_pages INTEGER DEFAULT 100,
+    max_depth INTEGER DEFAULT 3,
+    include_paths TEXT,
+    exclude_paths TEXT,
+    status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','paused','done','failed','cancelled')),
+    pages_found INTEGER DEFAULT 0,
+    pages_done INTEGER DEFAULT 0,
+    frontier TEXT,
+    visited TEXT,
+    error TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT,
+    FOREIGN KEY (kb_id) REFERENCES knowledge_bases(id) ON DELETE CASCADE
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_kb_sections ON kb_sections(kb_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_kb_entries ON kb_entries(kb_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_kb_sources ON kb_sources(kb_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_kb_chunks ON kb_chunks(kb_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_kb_crawl_jobs ON kb_crawl_jobs(kb_id)`
 ];
 var EMAIL_MESSAGE_MIGRATIONS = [
   `ALTER TABLE email_messages ADD COLUMN direction TEXT DEFAULT 'outbound'`,
@@ -254,6 +337,17 @@ var TENANCY_MIGRATIONS = [
   `ALTER TABLE users ADD COLUMN gmail_email TEXT`,
   `ALTER TABLE users ADD COLUMN gmail_app_password TEXT`
 ];
+var CALL_LOG_MIGRATIONS = [
+  `ALTER TABLE call_logs ADD COLUMN provider TEXT`,
+  `ALTER TABLE call_logs ADD COLUMN phlo_id TEXT`,
+  `ALTER TABLE call_logs ADD COLUMN prompt_used TEXT`,
+  `ALTER TABLE call_logs ADD COLUMN from_number TEXT`,
+  `ALTER TABLE call_logs ADD COLUMN to_number TEXT`,
+  // Plivo returns a *static* flow UUID as phlo_id (verified: identical across
+  // runs), so it cannot identify a single call. api_id is unique per run and
+  // is the only reliable handle for matching Agentflow callbacks.
+  `ALTER TABLE call_logs ADD COLUMN plivo_api_id TEXT`
+];
 var DEMO_USER_HASH = "$2b$10$/ixfDGIckZ5KISPFS5y7puGhS4MGJkUJHkrdgDMG.si2aBQtWHy2u";
 async function initDb(c) {
   await c.batch(
@@ -266,7 +360,7 @@ async function initDb(c) {
     ],
     "write"
   );
-  for (const sql of [...EMAIL_MESSAGE_MIGRATIONS, ...WHATSAPP_MESSAGE_MIGRATIONS, ...ATTACHMENT_MIGRATIONS, ...USER_ACCESS_MIGRATIONS, ...TENANCY_MIGRATIONS]) {
+  for (const sql of [...EMAIL_MESSAGE_MIGRATIONS, ...WHATSAPP_MESSAGE_MIGRATIONS, ...ATTACHMENT_MIGRATIONS, ...USER_ACCESS_MIGRATIONS, ...TENANCY_MIGRATIONS, ...CALL_LOG_MIGRATIONS]) {
     try {
       await c.execute(sql);
     } catch {
@@ -292,8 +386,13 @@ async function initDb(c) {
     SELECT 'evt-' || id, lead_id, 'call', COALESCE(status, 'pending'), goal, id, created_at
     FROM call_logs
   `);
+  await c.execute(`CREATE UNIQUE INDEX IF NOT EXISTS idx_call_logs_plivo_api ON call_logs(plivo_api_id) WHERE plivo_api_id IS NOT NULL`);
   await migrateLeadsToGenericPipeline(c);
   await migrateEventsToConversations(c);
+  try {
+    await c.execute(`CREATE VIRTUAL TABLE IF NOT EXISTS kb_chunks_fts USING fts5(chunk_id UNINDEXED, kb_id UNINDEXED, text)`);
+  } catch {
+  }
 }
 async function migrateLeadsToGenericPipeline(c) {
   const cols = (await c.execute(`SELECT name FROM pragma_table_info('leads')`)).rows.map(
@@ -779,6 +878,120 @@ async function sendMessage(args, cfg = mailerConfig()) {
   return { message_id: info.messageId ?? null, thread_id: null };
 }
 
+// src/lib/plivo-agentflow.ts
+function brief(value, max = 400) {
+  const s = (value ?? "").trim().replace(/\s+/g, " ");
+  return s.length > max ? `${s.slice(0, max - 1)}\u2026` : s;
+}
+function normalizePhone(raw) {
+  if (!raw) return null;
+  const trimmed = raw.trim();
+  const base = trimmed.replace(/\s*(?:ext|ext\.|x|extension|#)\s*\d+\s*$/i, "").trim();
+  const plus = base.startsWith("+") ? "+" : "";
+  const digits = base.replace(/\D/g, "");
+  if (!digits) return null;
+  const e164 = `${plus}${digits}`;
+  if (digits.length < 8 || digits.length > 15) return null;
+  return e164;
+}
+function buildAgentBrief(lead, goal) {
+  const budget = lead.budget_min != null && lead.budget_max != null ? `${lead.budget_min}\u2013${lead.budget_max}` : lead.budget_max != null ? `up to ${lead.budget_max}` : lead.budget_min != null ? `from ${lead.budget_min}` : null;
+  const facts = [
+    `Lead name: ${lead.name}`,
+    lead.company ? `Company: ${lead.company}` : null,
+    lead.city ? `Location: ${lead.city}` : null,
+    lead.region ? `Region: ${lead.region}` : null,
+    lead.interest ? `Requirement / interest: ${lead.interest}` : null,
+    lead.category ? `Category: ${lead.category}` : null,
+    budget ? `Budget: ${budget}` : null,
+    lead.urgency ? `Urgency: ${lead.urgency}` : null,
+    lead.value != null ? `Deal value: ${lead.value}` : null,
+    `Pipeline status: ${lead.status}`,
+    goal ? `Call goal: ${goal}` : null,
+    lead.notes ? `Notes: ${brief(lead.notes, 800)}` : null
+  ].filter(Boolean);
+  return [
+    "You are calling a sales lead on behalf of GradLeadAI. Use ONLY the details below when speaking to them.",
+    "",
+    ...facts,
+    "",
+    "Open by identifying yourself and referring to their stated requirement. Confirm the details, answer their questions, and aim to move them to the next step. If something is not in these details, say so and offer to follow up \u2014 do not invent facts, prices, or dates."
+  ].join("\n");
+}
+async function triggerAgentflow(payload) {
+  const url = process.env.PLIVO_AGENTFLOW_URL?.trim();
+  if (!url) {
+    throw new Error("AI voice agent is not configured \u2014 set PLIVO_AGENTFLOW_URL in the environment.");
+  }
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(`Voice agent rejected the request (${res.status}): ${text.slice(0, 300)}`);
+  }
+  let data = {};
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+  }
+  return {
+    phlo_id: data.phlo_id ?? null,
+    api_id: data.api_id ?? null,
+    message: data.message ?? null
+  };
+}
+function buildTriggerPayload(args) {
+  const { leadId, callId, toNumber, leadName, brief: brief2, company, interest, goal } = args;
+  return {
+    // Destination — matches whichever name the flow's Screen Contact node uses.
+    to: toNumber,
+    to_number: toNumber,
+    phone: toNumber,
+    phone_number: toNumber,
+    destination: toNumber,
+    destination_number: toNumber,
+    number: toNumber,
+    lead_phone: toNumber,
+    // Who we're calling.
+    name: leadName,
+    lead_name: leadName,
+    contact_name: leadName,
+    first_name: leadName.split(" ")[0],
+    company,
+    // What the agent should talk about.
+    prompt: brief2,
+    context: brief2,
+    requirements: brief2,
+    details: brief2,
+    brief: brief2,
+    system_prompt: brief2,
+    instructions: brief2,
+    notes: brief2,
+    message: brief2,
+    description: brief2,
+    lead_context: brief2,
+    conversation_brief: brief2,
+    summary: brief2,
+    // Goal + correlation ids so the flow can branch and we can match callbacks.
+    goal: goal ?? null,
+    call_goal: goal ?? null,
+    objective: goal ?? null,
+    interest,
+    requirement: interest,
+    // Correlation. `call_id` must be OUR call-log id, not the lead id, so a
+    // callback matches exactly one row. Plivo's own phlo_id is flow-level and
+    // identical for every run, so it cannot identify a single call.
+    call_id: callId,
+    reference_id: callId,
+    call_uuid: callId,
+    call_ref: callId,
+    lead_id: leadId
+  };
+}
+
 // src/lib/events.ts
 async function insertEvent(db, e) {
   const id = crypto.randomUUID();
@@ -819,6 +1032,239 @@ async function insertEvent(db, e) {
   return id;
 }
 
+// src/lib/knowledge.ts
+var RESERVED_SLUGS = /* @__PURE__ */ new Set([
+  "app",
+  "auth",
+  "api",
+  "kb",
+  "admin",
+  "blogs",
+  "blog",
+  "pricing",
+  "marketing",
+  "all-blogs",
+  "industries",
+  "new",
+  "settings",
+  "public",
+  "assets",
+  "favicon.ico"
+]);
+function slugify(input) {
+  return (input ?? "").toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60);
+}
+function isValidSlug(slug) {
+  return /^[a-z0-9](?:[a-z0-9-]{0,58}[a-z0-9])?$/.test(slug) && !RESERVED_SLUGS.has(slug);
+}
+async function uniqueSlug(db, base) {
+  let slug = slugify(base) || `kb-${crypto.randomUUID().slice(0, 6)}`;
+  if (RESERVED_SLUGS.has(slug)) slug = `${slug}-1`;
+  let candidate = slug;
+  for (let i = 2; i < 60; i++) {
+    const hit = (await db.execute({ sql: "SELECT id FROM knowledge_bases WHERE slug = ?", args: [candidate] })).rows[0];
+    if (!hit) return candidate;
+    candidate = `${slug}-${i}`;
+  }
+  return `${slug}-${crypto.randomUUID().slice(0, 6)}`;
+}
+var ENTITIES = {
+  "&nbsp;": " ",
+  "&amp;": "&",
+  "&lt;": "<",
+  "&gt;": ">",
+  "&quot;": '"',
+  "&#39;": "'",
+  "&apos;": "'",
+  "&mdash;": "\u2014",
+  "&ndash;": "\u2013",
+  "&hellip;": "\u2026",
+  "&rsquo;": "\u2019",
+  "&lsquo;": "\u2018",
+  "&ldquo;": "\u201C",
+  "&rdquo;": "\u201D"
+};
+function htmlToText(html) {
+  let s = (html ?? "").replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<noscript[\s\S]*?<\/noscript>/gi, " ").replace(/<svg[\s\S]*?<\/svg>/gi, " ").replace(/<head[\s\S]*?<\/head>/gi, " ").replace(/<!--[\s\S]*?-->/g, " ").replace(/<br\s*\/?>/gi, "\n").replace(/<\/(p|div|section|article|li|ul|ol|h[1-6]|tr|table|blockquote|pre)>/gi, "\n").replace(/<[^>]+>/g, " ");
+  for (const [entity, char] of Object.entries(ENTITIES)) {
+    s = s.split(entity).join(char);
+  }
+  s = s.replace(/&#(x?)([0-9a-f]+);/gi, (_, hex, num) => {
+    const code = parseInt(num, hex ? 16 : 10);
+    return Number.isFinite(code) ? String.fromCodePoint(code) : "";
+  });
+  return s.split("\n").map((line) => line.replace(/[ \t\f\v]+/g, " ").trim()).filter((line, i, arr) => line !== "" || i > 0 && arr[i - 1] !== "").join("\n").trim();
+}
+function chunkText(text, maxLen = 1200, overlap = 150) {
+  const clean = (text ?? "").replace(/\r/g, "").trim();
+  if (!clean) return [];
+  if (clean.length <= maxLen) return [clean];
+  const chunks = [];
+  let cur = "";
+  for (const para of clean.split(/\n{2,}/)) {
+    if ((cur ? cur.length + 2 : 0) + para.length <= maxLen) {
+      cur = cur ? `${cur}
+
+${para}` : para;
+      continue;
+    }
+    if (cur) chunks.push(cur);
+    if (para.length <= maxLen) {
+      cur = para;
+    } else {
+      for (let i = 0; i < para.length; i += maxLen - overlap) chunks.push(para.slice(i, i + maxLen));
+      cur = "";
+    }
+  }
+  if (cur) chunks.push(cur);
+  return chunks.filter((c) => c.trim().length > 0);
+}
+async function getOrCreateKb(db, userId, fallbackName) {
+  const existing = (await db.execute({ sql: "SELECT * FROM knowledge_bases WHERE user_id = ?", args: [userId] })).rows[0];
+  if (existing) return existing;
+  const id = crypto.randomUUID();
+  const title = (fallbackName ?? "").trim() || "My Business";
+  const slug = await uniqueSlug(db, title);
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  await db.execute({
+    sql: "INSERT INTO knowledge_bases (id, user_id, slug, title, status, created_at) VALUES (?, ?, ?, ?, 'draft', ?)",
+    args: [id, userId, slug, title, now]
+  });
+  return (await db.execute({ sql: "SELECT * FROM knowledge_bases WHERE id = ?", args: [id] })).rows[0];
+}
+async function addChunks(db, kbId, sourceId, texts) {
+  const clean = texts.map((t) => t.trim()).filter(Boolean);
+  if (!clean.length) return;
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  const rows = clean.map((text) => ({ id: crypto.randomUUID(), text }));
+  await db.batch(
+    rows.map(
+      (r) => ({
+        sql: "INSERT INTO kb_chunks (id, kb_id, source_id, text, created_at) VALUES (?, ?, ?, ?, ?)",
+        args: [r.id, kbId, sourceId, r.text, now]
+      })
+    ),
+    "write"
+  );
+  try {
+    await db.batch(
+      rows.map(
+        (r) => ({
+          sql: "INSERT INTO kb_chunks_fts (chunk_id, kb_id, text) VALUES (?, ?, ?)",
+          args: [r.id, kbId, r.text]
+        })
+      ),
+      "write"
+    );
+  } catch {
+  }
+}
+async function deleteSourceChunks(db, kbId, sourceId) {
+  try {
+    await db.execute({
+      sql: "DELETE FROM kb_chunks_fts WHERE chunk_id IN (SELECT id FROM kb_chunks WHERE kb_id = ? AND source_id = ?)",
+      args: [kbId, sourceId]
+    });
+  } catch {
+  }
+  await db.execute({ sql: "DELETE FROM kb_chunks WHERE kb_id = ? AND source_id = ?", args: [kbId, sourceId] });
+}
+async function deleteSource(db, kbId, sourceId) {
+  await deleteSourceChunks(db, kbId, sourceId);
+  await db.execute({ sql: "DELETE FROM kb_crawl_jobs WHERE kb_id = ? AND source_id = ?", args: [kbId, sourceId] });
+  await db.execute({ sql: "DELETE FROM kb_sources WHERE id = ? AND kb_id = ?", args: [sourceId, kbId] });
+}
+function ftsMatch(query) {
+  const tokens = Array.from(new Set((query ?? "").toLowerCase().match(/[a-z0-9]{2,}/g) ?? [])).slice(0, 12);
+  return tokens.map((t) => `${t}*`).join(" OR ");
+}
+async function searchChunks(db, kbId, query, k = 6) {
+  const match = ftsMatch(query);
+  if (match) {
+    try {
+      const rows = (await db.execute({
+        sql: `SELECT c.text AS text, c.source_id AS source_id
+              FROM kb_chunks_fts f JOIN kb_chunks c ON c.id = f.chunk_id
+              WHERE f.kb_id = ? AND kb_chunks_fts MATCH ?
+              ORDER BY bm25(kb_chunks_fts) LIMIT ?`,
+        args: [kbId, match, k]
+      })).rows;
+      if (rows.length) return rows;
+    } catch {
+    }
+  }
+  const like = match && query.trim() ? `%${query.trim().slice(0, 40)}%` : "%";
+  return (await db.execute({
+    sql: "SELECT text, source_id FROM kb_chunks WHERE kb_id = ? AND text LIKE ? ORDER BY created_at DESC LIMIT ?",
+    args: [kbId, like, k]
+  })).rows;
+}
+async function getKnowledgeContext(db, userId, query, opts = {}) {
+  const kb = (await db.execute({ sql: "SELECT * FROM knowledge_bases WHERE user_id = ?", args: [userId] })).rows[0];
+  if (!kb) return "";
+  const sections = (await db.execute({
+    sql: "SELECT kind, title, body FROM kb_sections WHERE kb_id = ? ORDER BY position ASC, created_at ASC",
+    args: [kb.id]
+  })).rows;
+  const entries = (await db.execute({
+    sql: "SELECT question, answer FROM kb_entries WHERE kb_id = ? ORDER BY position ASC, created_at ASC LIMIT 40",
+    args: [kb.id]
+  })).rows;
+  const chunks = await searchChunks(db, kb.id, query, opts.chunks ?? 6);
+  const parts = [];
+  const header = [kb.title, kb.tagline].filter(Boolean).join(" \u2014 ");
+  if (header) parts.push(`Business: ${header}`);
+  if (kb.description) parts.push(`About: ${kb.description}`);
+  const contact = [kb.contact_email, kb.contact_phone, kb.contact_website, kb.contact_address].filter(Boolean);
+  if (contact.length) parts.push(`Contact: ${contact.join(" \xB7 ")}`);
+  for (const s of sections) {
+    const body = (s.body ?? "").trim();
+    if (body) parts.push(`${s.title ?? s.kind ?? "Section"}: ${body}`);
+  }
+  if (entries.length) {
+    parts.push("FAQ:\n" + entries.map((e) => `Q: ${e.question}
+A: ${e.answer}`).join("\n"));
+  }
+  if (chunks.length) {
+    parts.push("Details:\n" + chunks.map((c) => c.text).join("\n---\n"));
+  }
+  let out = parts.join("\n\n").trim();
+  const maxChars = opts.maxChars ?? 6e3;
+  if (out.length > maxChars) out = `${out.slice(0, maxChars)}\u2026`;
+  return out;
+}
+async function getPublicKb(db, slug) {
+  const kb = (await db.execute({
+    sql: "SELECT * FROM knowledge_bases WHERE slug = ? AND status = 'published'",
+    args: [slug]
+  })).rows[0];
+  if (!kb) return null;
+  const sections = (await db.execute({
+    sql: "SELECT kind, title, body FROM kb_sections WHERE kb_id = ? ORDER BY position ASC, created_at ASC",
+    args: [kb.id]
+  })).rows;
+  const faqs = (await db.execute({
+    sql: "SELECT question, answer FROM kb_entries WHERE kb_id = ? ORDER BY position ASC, created_at ASC LIMIT 100",
+    args: [kb.id]
+  })).rows;
+  return {
+    slug: kb.slug ?? slug,
+    title: kb.title,
+    tagline: kb.tagline,
+    description: kb.description,
+    contact: {
+      email: kb.contact_email,
+      phone: kb.contact_phone,
+      website: kb.contact_website,
+      address: kb.contact_address
+    },
+    sections: sections.map((s) => ({ kind: s.kind, title: s.title, body: s.body })),
+    faqs,
+    published_at: kb.published_at,
+    updated_at: kb.updated_at
+  };
+}
+
 // src/lib/whatsapp.ts
 var DEFAULT_SESSION = "default";
 function env(name) {
@@ -835,12 +1281,12 @@ function whatsappConfig() {
     webhookSecret: env("RELAYX_WEBHOOK_SECRET")
   };
 }
-function normalizePhone(raw) {
+function normalizePhone2(raw) {
   return (raw ?? "").replace(/[^\d]/g, "");
 }
 function phoneMatches(a, b) {
-  const na = normalizePhone(a);
-  const nb = normalizePhone(b);
+  const na = normalizePhone2(a);
+  const nb = normalizePhone2(b);
   if (!na || !nb) return false;
   const len = Math.min(10, Math.min(na.length, nb.length));
   if (len === 0) return false;
@@ -980,7 +1426,7 @@ async function sendText(to, text) {
   const cfg = whatsappConfig();
   if (!cfg.enabled) return { ok: false, providerMessageId: null, error: "WhatsApp provider is not configured (RELAYX_API_KEY)" };
   if (!cfg.base) return { ok: false, providerMessageId: null, error: "RELAYX_BASE_URL is not set" };
-  const chatId = `${normalizePhone(to)}@c.us`;
+  const chatId = `${normalizePhone2(to)}@c.us`;
   const url = `${cfg.base}/api/sendText`;
   let res;
   try {
@@ -1011,7 +1457,7 @@ async function sendMedia(to, file) {
   const cfg = whatsappConfig();
   if (!cfg.enabled) return { ok: false, providerMessageId: null, error: "WhatsApp provider is not configured (RELAYX_API_KEY)" };
   if (!cfg.base) return { ok: false, providerMessageId: null, error: "RELAYX_BASE_URL is not set" };
-  const chatId = `${normalizePhone(to)}@c.us`;
+  const chatId = `${normalizePhone2(to)}@c.us`;
   const url = `${cfg.base}/api/sendMedia`;
   let res;
   try {
@@ -1465,6 +1911,68 @@ router3.post("/calls/status", async (c) => {
   await insertEvent(db, { lead_id: cl?.lead_id ?? null, channel: "call", action: d.outcome ?? d.status ?? "updated", source_ref: d.id });
   return c.json({ success: true });
 });
+router3.post("/calls/dial", async (c) => {
+  const user = await authenticate(c);
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  try {
+    const data = z3.object({ lead_id: z3.string(), goal: z3.string().optional() }).parse(await c.req.json());
+    const db = await getDb();
+    const lead = (await db.execute({ sql: "SELECT * FROM leads WHERE id = ? AND user_id = ?", args: [data.lead_id, user.id] })).rows[0];
+    if (!lead) return c.json({ error: "Lead not found" }, 404);
+    if (!lead.phone) return c.json({ error: `${lead.name} has no phone number \u2014 add one before calling.` }, 400);
+    const toNumber = normalizePhone(lead.phone);
+    if (!toNumber) {
+      return c.json({ error: `${lead.name}'s number "${lead.phone}" isn't a usable international format. Save it as +countrycode followed by digits, e.g. +91 70146 07737.` }, 400);
+    }
+    const kbContext = await getKnowledgeContext(db, user.id, [lead.interest, lead.category, data.goal].filter(Boolean).join(" "));
+    const brief2 = buildAgentBrief(lead, data.goal) + (kbContext ? `
+
+Business knowledge base (answer questions about the business from this \u2014 do not invent facts):
+${kbContext}` : "");
+    const id = crypto.randomUUID();
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    let run;
+    try {
+      run = await triggerAgentflow(
+        buildTriggerPayload({
+          leadId: lead.id,
+          callId: id,
+          toNumber,
+          leadName: lead.name,
+          brief: brief2,
+          company: lead.company,
+          interest: lead.interest,
+          goal: data.goal ?? null
+        })
+      );
+    } catch (e) {
+      await db.batch([
+        {
+          sql: "INSERT INTO call_logs (id, lead_id, goal, status, outcome, provider, from_number, to_number, created_at) VALUES (?, ?, ?, 'failed', ?, 'plivo', NULL, ?, ?)",
+          args: [id, lead.id, data.goal ?? null, e.message.slice(0, 500), toNumber, now]
+        },
+        {
+          sql: "INSERT INTO events (id, lead_id, channel, action, summary, source_ref, created_at) VALUES (?, ?, 'call', 'failed', ?, ?, ?)",
+          args: [crypto.randomUUID(), lead.id, `Call to ${lead.name} failed to start`, id, now]
+        }
+      ], "write");
+      return c.json({ error: e.message }, 502);
+    }
+    await db.batch([
+      {
+        sql: "INSERT INTO call_logs (id, lead_id, goal, status, provider, phlo_id, plivo_api_id, prompt_used, to_number, started_at, created_at) VALUES (?, ?, ?, 'in_progress', 'plivo', ?, ?, ?, ?, ?, ?)",
+        args: [id, lead.id, data.goal ?? null, run.phlo_id, run.api_id, brief2, toNumber, now, now]
+      },
+      {
+        sql: "INSERT INTO events (id, lead_id, channel, action, summary, source_ref, created_at) VALUES (?, ?, 'call', 'initiated', ?, ?, ?)",
+        args: [crypto.randomUUID(), lead.id, `AI agent calling ${lead.name} about ${lead.interest ?? "their enquiry"}`, id, now]
+      }
+    ], "write");
+    return c.json({ success: true, call_id: id, phlo_id: run.phlo_id, message: run.message, brief: brief2, to_number: toNumber });
+  } catch (e) {
+    return c.json({ error: e.message }, 400);
+  }
+});
 router3.get("/appointments", async (c) => {
   const user = await authenticate(c);
   if (!user) return c.json({ error: "Unauthorized" }, 401);
@@ -1636,11 +2144,15 @@ router4.post("/chat", async (c) => {
   if (!authedUser) return c.json({ error: "Unauthorized" }, 401);
   const { question, leads, history } = z4.object({ question: z4.string(), leads: z4.array(z4.any()), history: historySchema.optional() }).parse(await c.req.json());
   const ai = gateway();
+  const kbContext = await getKnowledgeContext(await getDb(), authedUser.id, question);
   let text;
   try {
     const res = await generateText({
       model: ai(MODEL),
-      system: `You are an assistant for a lead-management CRM (prospects, customers, deals). Answer ONLY using the provided leads data. Be concise. Cite leads as [lead:FULL_ID]. Do not invent leads or their data, and never substitute a different lead when the one being discussed lacks a field \u2014 say that field is missing instead. The conversation may reference a lead named earlier in the thread \u2014 use that context to resolve follow-up questions (e.g. "his email" or "show me his number" refers to the lead just discussed, not a different one). You have two real tools: send_email and send_whatsapp. Use them ONLY when the user explicitly asks you to send an email or WhatsApp message to a specific lead. Compose the content yourself from the lead's requirements. After a tool succeeds, confirm briefly what was sent and to whom. If a tool reports an error, tell the user what happened and what they can do (e.g. add the missing email/phone, or send from Email Studio).`,
+      system: `You are an assistant for a lead-management CRM (prospects, customers, deals). Answer ONLY using the provided leads data. Be concise. Cite leads as [lead:FULL_ID]. Do not invent leads or their data, and never substitute a different lead when the one being discussed lacks a field \u2014 say that field is missing instead. The conversation may reference a lead named earlier in the thread \u2014 use that context to resolve follow-up questions (e.g. "his email" or "show me his number" refers to the lead just discussed, not a different one). You have two real tools: send_email and send_whatsapp. Use them ONLY when the user explicitly asks you to send an email or WhatsApp message to a specific lead. Compose the content yourself from the lead's requirements. After a tool succeeds, confirm briefly what was sent and to whom. If a tool reports an error, tell the user what happened and what they can do (e.g. add the missing email/phone, or send from Email Studio).` + (kbContext ? `
+
+The business has provided the following knowledge base \u2014 use it to answer questions about the business itself (products, services, hours, location, policies, FAQs). Do not invent facts beyond it:
+${kbContext}` : ""),
       messages: [
         { role: "user", content: `Leads (${leads.length}):
 ${leadsBlock(leads)}` },
@@ -1664,12 +2176,15 @@ ${leadsBlock(leads)}` },
   return c.json({ text, citations: cited });
 });
 router4.post("/email", async (c) => {
-  if (!await authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
+  const user = await authenticate(c);
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
   const { lead, tone, goal, senderName } = z4.object({ lead: z4.any(), tone: z4.string(), goal: z4.string(), senderName: z4.string().optional() }).parse(await c.req.json());
   const ai = gateway();
+  const kbContext = await getKnowledgeContext(await getDb(), user.id, `${goal} ${lead?.name ?? ""} ${lead?.interest ?? ""}`);
   const { text } = await generateText({
     model: ai(MODEL),
-    system: `You write short, high-converting sales and outreach emails for a small business (introductions, proposals, follow-ups, check-ins). Reply as strict JSON: {"subject":"...","body":"..."}. Keep body under 110 words. Sign as ${senderName ?? "Jordan"}.`,
+    system: `You write short, high-converting sales and outreach emails for a small business (introductions, proposals, follow-ups, check-ins). Reply as strict JSON: {"subject":"...","body":"..."}. Keep body under 110 words. Sign as ${senderName ?? "Jordan"}.${kbContext ? ` Use this knowledge base for accurate facts about the business; do not invent details:
+${kbContext}` : ""}`,
     prompt: `Tone: ${tone}
 Goal: ${goal}
 Lead: ${JSON.stringify(lead)}`
@@ -1682,12 +2197,15 @@ Lead: ${JSON.stringify(lead)}`
   }
 });
 router4.post("/whatsapp", async (c) => {
-  if (!await authenticate(c)) return c.json({ error: "Unauthorized" }, 401);
+  const user = await authenticate(c);
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
   const { lead, intent } = z4.object({ lead: z4.any(), intent: z4.string() }).parse(await c.req.json());
   const ai = gateway();
+  const kbContext = await getKnowledgeContext(await getDb(), user.id, `${intent} ${lead?.name ?? ""} ${lead?.interest ?? ""}`);
   const { text } = await generateText({
     model: ai(MODEL),
-    system: "Write a friendly, concise follow-up WhatsApp message (1-3 sentences, max 280 chars) \u2014 e.g. appointment reminders, quick check-ins, or next-step updates. Use the lead's first name. One emoji max. Return ONLY the message body.",
+    system: `Write a friendly, concise follow-up WhatsApp message (1-3 sentences, max 280 chars) \u2014 e.g. appointment reminders, quick check-ins, or next-step updates. Use the lead's first name. One emoji max. Return ONLY the message body.${kbContext ? ` Use these business details for accuracy; do not invent facts:
+${kbContext}` : ""}`,
     prompt: `Intent: ${intent}
 Lead: ${JSON.stringify(lead)}`
   });
@@ -1922,7 +2440,7 @@ async function findOrCreateLead(db, msg) {
   await db.execute({
     sql: `INSERT INTO leads (id, name, phone, source, status, score, last_activity, created_at)
       VALUES (?, ?, ?, 'whatsapp inbound', 'new', 0, ?, ?)`,
-    args: [id, name, normalizePhone(msg.from), now, now]
+    args: [id, name, normalizePhone2(msg.from), now, now]
   });
   return id;
 }
@@ -1945,7 +2463,7 @@ async function maybeAutoAck(db, msg, inboundId, fromNumber) {
       crypto.randomUUID(),
       autoAckText(),
       fromNumber,
-      normalizePhone(msg.from),
+      normalizePhone2(msg.from),
       send.providerMessageId,
       now
     ]
@@ -1967,12 +2485,119 @@ async function maybeAutoAck(db, msg, inboundId, fromNumber) {
 }
 var whatsapp_webhook_default = router6;
 
-// src/routes/admin.ts
+// src/routes/plivo-webhook.ts
 import { Hono as Hono7 } from "hono";
+var router7 = new Hono7();
+function pick(source, ...keys) {
+  for (const k of keys) {
+    const v = source[k];
+    if (typeof v === "string" && v.trim()) return v.trim();
+    if (typeof v === "number") return String(v);
+  }
+  return null;
+}
+function mapStatus(raw) {
+  if (!raw) return null;
+  const s = raw.toLowerCase();
+  if (/completed|answered|hangup|end/.test(s)) return { status: "completed", ended: true };
+  if (/no.?answer|unanswered|missed/.test(s)) return { status: "no_answer", ended: true };
+  if (/busy|rejected|failed|error|cancel/.test(s)) return { status: "failed", ended: true };
+  if (/ringing|in.?progress|queued|initiated|answered_screen/.test(s)) return { status: "in_progress", ended: false };
+  return null;
+}
+router7.post("/", async (c) => {
+  let body;
+  try {
+    body = await c.req.json() ?? {};
+  } catch {
+    return c.json({ ok: true, ignored: "non-JSON body" });
+  }
+  const src = body.payload ?? body.event ?? body.data ?? body;
+  const apiId = pick(src, "api_id", "apiId", "request_id", "run_id");
+  const phloId = pick(src, "phlo_id", "flow_run_id", "phloId");
+  const callRef = pick(src, "call_id", "reference_id", "call_uuid", "callUUID");
+  const rawStatus = pick(src, "status", "call_status", "event", "EventStatus", "state");
+  const mapped = mapStatus(rawStatus);
+  if (!apiId && !phloId && !callRef) return c.json({ ok: true, ignored: "no correlation id" });
+  const db = await getDb();
+  let row;
+  if (apiId) {
+    row = (await db.execute({ sql: "SELECT id, lead_id FROM call_logs WHERE plivo_api_id = ? LIMIT 1", args: [apiId] })).rows[0];
+  }
+  if (!row && callRef) {
+    row = (await db.execute({ sql: "SELECT id, lead_id FROM call_logs WHERE id = ? LIMIT 1", args: [callRef] })).rows[0];
+  }
+  if (!row && phloId) {
+    const hits = (await db.execute({ sql: "SELECT id, lead_id FROM call_logs WHERE phlo_id = ?", args: [phloId] })).rows;
+    if (hits.length === 1) row = hits[0];
+    else if (hits.length > 1) {
+      return c.json({ ok: true, ignored: "ambiguous phlo_id (flow-level id, not unique per call)", matches: hits.length });
+    }
+  }
+  if (!row) return c.json({ ok: true, ignored: "unknown call" });
+  if (apiId) {
+    await db.execute({
+      sql: "UPDATE call_logs SET plivo_api_id = COALESCE(plivo_api_id, ?) WHERE id = ?",
+      args: [apiId, row.id]
+    });
+  }
+  const transcript = pick(src, "transcript", "conversation", "dialogue");
+  const summary = pick(src, "summary", "call_summary");
+  const outcome = pick(src, "outcome", "result", "disposition");
+  const duration = Number(src["duration"] ?? src["duration_sec"] ?? NaN);
+  const sets = [];
+  const vals = [];
+  if (mapped) {
+    sets.push("status = ?");
+    vals.push(mapped.status);
+    if (mapped.ended) {
+      sets.push("ended_at = ?");
+      vals.push((/* @__PURE__ */ new Date()).toISOString());
+    }
+  }
+  if (transcript) {
+    sets.push("transcript = ?");
+    vals.push(transcript);
+  }
+  if (summary) {
+    sets.push("summary = ?");
+    vals.push(summary);
+  }
+  if (outcome) {
+    sets.push("outcome = ?");
+    vals.push(outcome);
+  }
+  if (Number.isFinite(duration) && duration > 0) {
+    sets.push("duration_sec = ?");
+    vals.push(Math.round(duration));
+  }
+  if (sets.length) {
+    vals.push(row.id);
+    await db.execute({ sql: `UPDATE call_logs SET ${sets.join(", ")} WHERE id = ?`, args: vals });
+  }
+  if (mapped) {
+    await db.execute({
+      sql: "INSERT OR IGNORE INTO events (id, lead_id, channel, action, summary, source_ref, created_at) VALUES (?, ?, 'call', ?, ?, ?, ?)",
+      args: [
+        crypto.randomUUID(),
+        row.lead_id,
+        mapped.status,
+        summary ?? `AI call ${mapped.status.replace("_", " ")}`,
+        row.id,
+        (/* @__PURE__ */ new Date()).toISOString()
+      ]
+    });
+  }
+  return c.json({ success: true, call_id: row.id, status: mapped?.status ?? null });
+});
+var plivo_webhook_default = router7;
+
+// src/routes/admin.ts
+import { Hono as Hono8 } from "hono";
 import { z as z6 } from "zod";
 import bcrypt2 from "bcryptjs";
-var router7 = new Hono7();
-router7.use("/*", async (c, next) => {
+var router8 = new Hono8();
+router8.use("/*", async (c, next) => {
   const admin = await authenticateAdmin(c);
   if (!admin) return c.json({ error: "Forbidden" }, 403);
   c.set("admin", admin);
@@ -1995,12 +2620,12 @@ var USER_COLUMNS = "id, name, email, is_admin, disabled, gmail_email, created_at
 function shapeUser(r) {
   return { ...r, is_admin: !!r.is_admin, disabled: !!r.disabled, has_gmail: !!r.gmail_email };
 }
-router7.get("/users", async (c) => {
+router8.get("/users", async (c) => {
   const db = await getDb();
   const rows = (await db.execute(`SELECT ${USER_COLUMNS} FROM users ORDER BY created_at DESC`)).rows;
   return c.json(rows.map(shapeUser));
 });
-router7.post("/users", async (c) => {
+router8.post("/users", async (c) => {
   try {
     const data = createUserSchema.parse(await c.req.json());
     const db = await getDb();
@@ -2026,7 +2651,7 @@ router7.post("/users", async (c) => {
     return c.json({ error: e.message }, 400);
   }
 });
-router7.post("/users/:id/email-credentials", async (c) => {
+router8.post("/users/:id/email-credentials", async (c) => {
   try {
     const id = Number(c.req.param("id"));
     if (!Number.isFinite(id)) return c.json({ error: "Invalid user id" }, 400);
@@ -2052,7 +2677,7 @@ router7.post("/users/:id/email-credentials", async (c) => {
     return c.json({ error: e.message }, 400);
   }
 });
-router7.delete("/users/:id", async (c) => {
+router8.delete("/users/:id", async (c) => {
   const admin = c.get("admin");
   const id = Number(c.req.param("id"));
   if (!Number.isFinite(id)) return c.json({ error: "Invalid user id" }, 400);
@@ -2061,7 +2686,7 @@ router7.delete("/users/:id", async (c) => {
   await db.execute({ sql: "DELETE FROM users WHERE id = ?", args: [id] });
   return c.json({ success: true });
 });
-router7.post("/users/:id/disable", async (c) => {
+router8.post("/users/:id/disable", async (c) => {
   const admin = c.get("admin");
   const id = Number(c.req.param("id"));
   if (!Number.isFinite(id)) return c.json({ error: "Invalid user id" }, 400);
@@ -2071,14 +2696,14 @@ router7.post("/users/:id/disable", async (c) => {
   await db.execute({ sql: "DELETE FROM sessions WHERE user_id = ?", args: [id] });
   return c.json({ success: true });
 });
-router7.post("/users/:id/enable", async (c) => {
+router8.post("/users/:id/enable", async (c) => {
   const id = Number(c.req.param("id"));
   if (!Number.isFinite(id)) return c.json({ error: "Invalid user id" }, 400);
   const db = await getDb();
   await db.execute({ sql: "UPDATE users SET disabled = 0 WHERE id = ?", args: [id] });
   return c.json({ success: true });
 });
-router7.post("/users/:id/reset-password", async (c) => {
+router8.post("/users/:id/reset-password", async (c) => {
   try {
     const id = Number(c.req.param("id"));
     if (!Number.isFinite(id)) return c.json({ error: "Invalid user id" }, 400);
@@ -2092,7 +2717,7 @@ router7.post("/users/:id/reset-password", async (c) => {
     return c.json({ error: e.message }, 400);
   }
 });
-router7.post("/users/:id/generate-password", async (c) => {
+router8.post("/users/:id/generate-password", async (c) => {
   const id = Number(c.req.param("id"));
   if (!Number.isFinite(id)) return c.json({ error: "Invalid user id" }, 400);
   const db = await getDb();
@@ -2102,11 +2727,615 @@ router7.post("/users/:id/generate-password", async (c) => {
   await db.execute({ sql: "DELETE FROM sessions WHERE user_id = ?", args: [id] });
   return c.json({ success: true, password });
 });
-var admin_default = router7;
+var admin_default = router8;
+
+// src/routes/knowledge.ts
+import { Hono as Hono9 } from "hono";
+import { z as z7 } from "zod";
+
+// src/lib/crawler.ts
+var USER_AGENT = "GradLeadAI-KnowledgeBot/1.0";
+var FETCH_TIMEOUT_MS = 8e3;
+var ROBOTS_TIMEOUT_MS = 4e3;
+var MAX_PAGE_BYTES = 2e6;
+function clampLimit(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return 100;
+  return Math.max(1, Math.min(500, Math.round(v)));
+}
+function clampDepth(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return 3;
+  return Math.max(0, Math.min(5, Math.round(v)));
+}
+function normalizeUrl(raw, base) {
+  try {
+    const u = new URL(raw, base);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+    u.hash = "";
+    for (const p of ["utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "fbclid", "gclid"]) {
+      u.searchParams.delete(p);
+    }
+    let s = u.toString();
+    if (s.endsWith("/")) s = s.slice(0, -1);
+    return s;
+  } catch {
+    return null;
+  }
+}
+function globToRegExp(pattern) {
+  const escaped = pattern.trim().replace(/^\//, "").replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
+  return new RegExp(`^${escaped}`);
+}
+function pathAllowed(pathname, include, exclude) {
+  const p = pathname.replace(/^\//, "");
+  if (exclude.some((pat) => globToRegExp(pat).test(p))) return false;
+  if (include.length === 0) return true;
+  return include.some((pat) => globToRegExp(pat).test(p));
+}
+function splitPaths(raw) {
+  return (raw ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+}
+async function fetchWithTimeout(url, ms) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  try {
+    return await fetch(url, {
+      redirect: "follow",
+      signal: ctrl.signal,
+      headers: { "User-Agent": USER_AGENT, Accept: "text/html,text/plain,*/*" }
+    });
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+async function fetchRobots(origin) {
+  try {
+    const res = await fetchWithTimeout(`${origin}/robots.txt`, ROBOTS_TIMEOUT_MS);
+    if (!res || !res.ok) return [];
+    const text = await res.text();
+    const disallow = [];
+    let applies = false;
+    for (const line of text.split("\n")) {
+      const l = line.replace(/#.*/, "").trim();
+      if (!l) continue;
+      const [key, ...rest] = l.split(":");
+      const k = key.trim().toLowerCase();
+      const v = rest.join(":").trim();
+      if (k === "user-agent") applies = v === "*" || v.toLowerCase().includes("gradlead");
+      else if (k === "disallow" && applies && v) disallow.push(v);
+    }
+    return disallow;
+  } catch {
+    return [];
+  }
+}
+function extractLinks(html, base) {
+  const out = [];
+  const re = /<a\b[^>]*href\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi;
+  let m;
+  while (m = re.exec(html)) {
+    const href = m[1] ?? m[2] ?? m[3] ?? "";
+    const abs = normalizeUrl(href, base);
+    if (abs) out.push(abs);
+  }
+  return out;
+}
+function parseJson(raw, fallback) {
+  if (!raw) return fallback;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return fallback;
+  }
+}
+async function getCrawlJob(db, jobId) {
+  const row = (await db.execute({ sql: "SELECT * FROM kb_crawl_jobs WHERE id = ?", args: [jobId] })).rows[0];
+  return row ?? null;
+}
+async function startCrawl(db, kbId, opts) {
+  const startUrl = normalizeUrl(opts.sourceUrl);
+  if (!startUrl) throw new Error("Enter a valid http(s) website URL.");
+  const host = new URL(startUrl).host;
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  const prev = (await db.execute({
+    sql: "SELECT id FROM kb_sources WHERE kb_id = ? AND type = 'url' AND name = ?",
+    args: [kbId, host]
+  })).rows;
+  for (const p of prev) await deleteSourceChunks(db, kbId, p.id);
+  await db.execute({ sql: "DELETE FROM kb_sources WHERE kb_id = ? AND type = 'url' AND name = ?", args: [kbId, host] });
+  await db.execute({ sql: "DELETE FROM kb_crawl_jobs WHERE kb_id = ? AND host = ?", args: [kbId, host] });
+  const sourceId = crypto.randomUUID();
+  const jobId = crypto.randomUUID();
+  await db.execute({
+    sql: "INSERT INTO kb_sources (id, kb_id, type, name, status, created_at) VALUES (?, ?, 'url', ?, 'crawling', ?)",
+    args: [sourceId, kbId, host, now]
+  });
+  const frontier = [{ url: startUrl, depth: 0 }];
+  await db.execute({
+    sql: `INSERT INTO kb_crawl_jobs
+      (id, kb_id, source_id, source_url, host, limit_pages, max_depth, include_paths, exclude_paths,
+       status, pages_found, pages_done, frontier, visited, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 1, 0, ?, '[]', ?, ?)`,
+    args: [
+      jobId,
+      kbId,
+      sourceId,
+      startUrl,
+      host,
+      clampLimit(opts.limit),
+      clampDepth(opts.maxDepth),
+      (opts.includePaths ?? []).join(","),
+      (opts.excludePaths ?? []).join(","),
+      JSON.stringify(frontier),
+      now,
+      now
+    ]
+  });
+  return { jobId, sourceId };
+}
+async function processCrawl(db, jobId, budgetMs = 25e3) {
+  const job = await getCrawlJob(db, jobId);
+  if (!job) throw new Error("Crawl job not found");
+  if (job.status === "done" || job.status === "failed" || job.status === "cancelled") return job;
+  if (!job.source_id) throw new Error("Crawl job has no source");
+  const started = Date.now();
+  const include = splitPaths(job.include_paths);
+  const exclude = splitPaths(job.exclude_paths);
+  const visited = new Set(parseJson(job.visited, []));
+  const frontier = parseJson(job.frontier, []);
+  const origin = new URL(job.source_url).origin;
+  const robots = await fetchRobots(origin);
+  const disallowed = (u) => {
+    try {
+      const p = new URL(u).pathname;
+      return robots.includes("/") || robots.some((d) => d !== "/" && p.startsWith(d));
+    } catch {
+      return true;
+    }
+  };
+  let done = job.pages_done;
+  let status = "running";
+  let error = null;
+  await db.execute({ sql: "UPDATE kb_crawl_jobs SET status = 'running', updated_at = ? WHERE id = ?", args: [(/* @__PURE__ */ new Date()).toISOString(), jobId] });
+  try {
+    while (frontier.length && done < job.limit_pages && Date.now() - started < budgetMs) {
+      const item = frontier.shift();
+      if (visited.has(item.url)) continue;
+      visited.add(item.url);
+      const res = await fetchWithTimeout(item.url, FETCH_TIMEOUT_MS);
+      if (!res || !res.ok) {
+        done++;
+        continue;
+      }
+      const ctype = res.headers.get("content-type") ?? "";
+      if (!/text\/html|text\/plain|application\/xhtml/i.test(ctype)) continue;
+      const buf = await res.arrayBuffer();
+      if (buf.byteLength > MAX_PAGE_BYTES) continue;
+      const body = new TextDecoder().decode(buf);
+      const isHtml = /html/i.test(ctype);
+      const text = isHtml ? htmlToText(body) : body;
+      if (text.length > 40) await addChunks(db, job.kb_id, job.source_id, chunkText(text));
+      done++;
+      if (isHtml && item.depth < job.max_depth) {
+        for (const link of extractLinks(body, item.url)) {
+          if (visited.has(link)) continue;
+          let lhost;
+          let lpath;
+          try {
+            const lu = new URL(link);
+            lhost = lu.host;
+            lpath = lu.pathname;
+          } catch {
+            continue;
+          }
+          if (lhost !== job.host) continue;
+          if (!pathAllowed(lpath, include, exclude)) continue;
+          if (disallowed(link)) continue;
+          if (frontier.some((f) => f.url === link)) continue;
+          frontier.push({ url: link, depth: item.depth + 1 });
+        }
+      }
+      await db.execute({
+        sql: "UPDATE kb_crawl_jobs SET pages_done = ?, pages_found = ?, frontier = ?, visited = ?, updated_at = ? WHERE id = ?",
+        args: [done, done + frontier.length, JSON.stringify(frontier), JSON.stringify(Array.from(visited)), (/* @__PURE__ */ new Date()).toISOString(), jobId]
+      });
+    }
+    status = frontier.length && done < job.limit_pages ? "paused" : "done";
+  } catch (e) {
+    status = "failed";
+    error = e.message;
+  }
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  await db.execute({
+    sql: "UPDATE kb_crawl_jobs SET status = ?, pages_done = ?, pages_found = ?, frontier = ?, visited = ?, error = ?, updated_at = ? WHERE id = ?",
+    args: [status, done, done + frontier.length, JSON.stringify(frontier), JSON.stringify(Array.from(visited)), error, now, jobId]
+  });
+  await db.execute({
+    sql: "UPDATE kb_sources SET status = ?, fetched_at = ? WHERE id = ?",
+    args: [status === "done" ? "ready" : status, now, job.source_id]
+  });
+  return await getCrawlJob(db, jobId);
+}
+async function cancelCrawl(db, jobId) {
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  await db.execute({ sql: "UPDATE kb_crawl_jobs SET status = 'cancelled', updated_at = ? WHERE id = ?", args: [now, jobId] });
+  const job = await getCrawlJob(db, jobId);
+  if (job?.source_id) {
+    await db.execute({ sql: "UPDATE kb_sources SET status = 'ready', fetched_at = ? WHERE id = ?", args: [now, job.source_id] });
+  }
+  return job;
+}
+
+// src/routes/knowledge.ts
+var router9 = new Hono9();
+async function loadKb(db, user) {
+  return getOrCreateKb(db, user.id, user.name ?? user.email);
+}
+router9.get("/", async (c) => {
+  const user = await authenticate(c);
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const db = await getDb();
+  const kb = await loadKb(db, user);
+  const sections = (await db.execute({
+    sql: "SELECT * FROM kb_sections WHERE kb_id = ? ORDER BY position ASC, created_at ASC",
+    args: [kb.id]
+  })).rows;
+  const entries = (await db.execute({
+    sql: "SELECT * FROM kb_entries WHERE kb_id = ? ORDER BY position ASC, created_at ASC",
+    args: [kb.id]
+  })).rows;
+  const sources = (await db.execute({
+    sql: "SELECT id, type, name, status, fetched_at, created_at FROM kb_sources WHERE kb_id = ? ORDER BY created_at DESC",
+    args: [kb.id]
+  })).rows;
+  const crawlJobs = (await db.execute({
+    sql: "SELECT id, source_id, source_url, host, limit_pages, max_depth, status, pages_found, pages_done, error, created_at, updated_at FROM kb_crawl_jobs WHERE kb_id = ? ORDER BY created_at DESC LIMIT 10",
+    args: [kb.id]
+  })).rows;
+  return c.json({ kb, sections, entries, sources, crawlJobs });
+});
+var profileSchema = z7.object({
+  title: z7.string().max(200).optional(),
+  tagline: z7.string().max(300).optional(),
+  description: z7.string().max(4e3).optional(),
+  contact_email: z7.string().max(200).optional(),
+  contact_phone: z7.string().max(60).optional(),
+  contact_website: z7.string().max(300).optional(),
+  contact_address: z7.string().max(400).optional(),
+  slug: z7.string().max(60).optional()
+});
+router9.put("/", async (c) => {
+  const user = await authenticate(c);
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const data = profileSchema.parse(await c.req.json());
+  const db = await getDb();
+  const kb = await loadKb(db, user);
+  const sets = [];
+  const vals = [];
+  for (const key of ["title", "tagline", "description", "contact_email", "contact_phone", "contact_website", "contact_address"]) {
+    if (data[key] !== void 0) {
+      sets.push(`${key} = ?`);
+      vals.push(data[key]?.trim() || null);
+    }
+  }
+  if (data.slug !== void 0) {
+    const slug = slugify(data.slug);
+    if (!isValidSlug(slug)) return c.json({ error: "That URL slug is not allowed \u2014 use letters, numbers and dashes." }, 400);
+    if (slug !== kb.slug) {
+      const taken = (await db.execute({ sql: "SELECT id FROM knowledge_bases WHERE slug = ? AND id != ?", args: [slug, kb.id] })).rows[0];
+      if (taken) return c.json({ error: "That URL is already taken." }, 409);
+      sets.push("slug = ?");
+      vals.push(slug);
+    }
+  }
+  sets.push("updated_at = ?");
+  vals.push((/* @__PURE__ */ new Date()).toISOString());
+  vals.push(kb.id);
+  await db.execute({ sql: `UPDATE knowledge_bases SET ${sets.join(", ")} WHERE id = ?`, args: vals });
+  const row = (await db.execute({ sql: "SELECT * FROM knowledge_bases WHERE id = ?", args: [kb.id] })).rows[0];
+  return c.json(row);
+});
+var sectionSchema = z7.object({
+  kind: z7.string().max(40).optional(),
+  title: z7.string().max(200).optional(),
+  body: z7.string().max(2e4).optional(),
+  position: z7.number().optional()
+});
+router9.post("/sections", async (c) => {
+  const user = await authenticate(c);
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const d = sectionSchema.parse(await c.req.json());
+  const db = await getDb();
+  const kb = await loadKb(db, user);
+  const id = crypto.randomUUID();
+  await db.execute({
+    sql: "INSERT INTO kb_sections (id, kb_id, kind, title, body, position) VALUES (?, ?, ?, ?, ?, ?)",
+    args: [id, kb.id, d.kind ?? "custom", d.title ?? null, d.body ?? null, d.position ?? 0]
+  });
+  const row = (await db.execute({ sql: "SELECT * FROM kb_sections WHERE id = ?", args: [id] })).rows[0];
+  await touch(db, kb.id);
+  return c.json(row);
+});
+router9.put("/sections/:id", async (c) => {
+  const user = await authenticate(c);
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const d = sectionSchema.parse(await c.req.json());
+  const db = await getDb();
+  const kb = await loadKb(db, user);
+  if (!await ownsRow(db, "kb_sections", c.req.param("id"), kb.id)) return c.json({ error: "Not found" }, 404);
+  const sets = [];
+  const vals = [];
+  if (d.kind !== void 0) {
+    sets.push("kind = ?");
+    vals.push(d.kind);
+  }
+  if (d.title !== void 0) {
+    sets.push("title = ?");
+    vals.push(d.title);
+  }
+  if (d.body !== void 0) {
+    sets.push("body = ?");
+    vals.push(d.body);
+  }
+  if (d.position !== void 0) {
+    sets.push("position = ?");
+    vals.push(d.position);
+  }
+  if (sets.length) {
+    vals.push(c.req.param("id"));
+    await db.execute({ sql: `UPDATE kb_sections SET ${sets.join(", ")} WHERE id = ?`, args: vals });
+  }
+  await touch(db, kb.id);
+  return c.json({ success: true });
+});
+router9.delete("/sections/:id", async (c) => {
+  const user = await authenticate(c);
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const db = await getDb();
+  const kb = await loadKb(db, user);
+  if (!await ownsRow(db, "kb_sections", c.req.param("id"), kb.id)) return c.json({ error: "Not found" }, 404);
+  await db.execute({ sql: "DELETE FROM kb_sections WHERE id = ?", args: [c.req.param("id")] });
+  await touch(db, kb.id);
+  return c.json({ success: true });
+});
+var entrySchema = z7.object({
+  question: z7.string().max(500).optional(),
+  answer: z7.string().max(8e3).optional(),
+  tags: z7.string().max(300).optional(),
+  position: z7.number().optional()
+});
+router9.post("/entries", async (c) => {
+  const user = await authenticate(c);
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const d = entrySchema.parse(await c.req.json());
+  if (!d.question?.trim() || !d.answer?.trim()) return c.json({ error: "Question and answer are required" }, 400);
+  const db = await getDb();
+  const kb = await loadKb(db, user);
+  const id = crypto.randomUUID();
+  await db.execute({
+    sql: "INSERT INTO kb_entries (id, kb_id, question, answer, tags, position) VALUES (?, ?, ?, ?, ?, ?)",
+    args: [id, kb.id, d.question.trim(), d.answer.trim(), d.tags ?? null, d.position ?? 0]
+  });
+  const row = (await db.execute({ sql: "SELECT * FROM kb_entries WHERE id = ?", args: [id] })).rows[0];
+  await touch(db, kb.id);
+  return c.json(row);
+});
+router9.put("/entries/:id", async (c) => {
+  const user = await authenticate(c);
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const d = entrySchema.parse(await c.req.json());
+  const db = await getDb();
+  const kb = await loadKb(db, user);
+  if (!await ownsRow(db, "kb_entries", c.req.param("id"), kb.id)) return c.json({ error: "Not found" }, 404);
+  const sets = [];
+  const vals = [];
+  if (d.question !== void 0) {
+    sets.push("question = ?");
+    vals.push(d.question);
+  }
+  if (d.answer !== void 0) {
+    sets.push("answer = ?");
+    vals.push(d.answer);
+  }
+  if (d.tags !== void 0) {
+    sets.push("tags = ?");
+    vals.push(d.tags);
+  }
+  if (d.position !== void 0) {
+    sets.push("position = ?");
+    vals.push(d.position);
+  }
+  if (sets.length) {
+    vals.push(c.req.param("id"));
+    await db.execute({ sql: `UPDATE kb_entries SET ${sets.join(", ")} WHERE id = ?`, args: vals });
+  }
+  await touch(db, kb.id);
+  return c.json({ success: true });
+});
+router9.delete("/entries/:id", async (c) => {
+  const user = await authenticate(c);
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const db = await getDb();
+  const kb = await loadKb(db, user);
+  if (!await ownsRow(db, "kb_entries", c.req.param("id"), kb.id)) return c.json({ error: "Not found" }, 404);
+  await db.execute({ sql: "DELETE FROM kb_entries WHERE id = ?", args: [c.req.param("id")] });
+  await touch(db, kb.id);
+  return c.json({ success: true });
+});
+var MAX_FILE_BYTES = 2e6;
+var fileSchema = z7.object({
+  files: z7.array(z7.object({
+    filename: z7.string().min(1).max(255),
+    contentType: z7.string().max(120).optional(),
+    data: z7.string().min(1)
+  })).min(1).max(10)
+});
+function fileToText(filename, contentType, buffer) {
+  const name = filename.toLowerCase();
+  const ct = (contentType ?? "").toLowerCase();
+  const isHtml = /\.(html?|xhtml)$/.test(name) || ct.includes("html");
+  if (isHtml) return htmlToText(buffer.toString("utf8"));
+  const textLike = /\.(txt|md|markdown|csv|tsv|json|xml|yaml|yml|log|rtf)$/.test(name) || /^text\//.test(ct) || /json|xml|csv|javascript|yaml/.test(ct);
+  if (!textLike) return null;
+  return buffer.toString("utf8");
+}
+router9.post("/files", async (c) => {
+  const user = await authenticate(c);
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const d = fileSchema.parse(await c.req.json());
+  const db = await getDb();
+  const kb = await loadKb(db, user);
+  const indexed = [];
+  const skipped = [];
+  for (const f of d.files) {
+    const buffer = Buffer.from(f.data, "base64");
+    if (buffer.byteLength > MAX_FILE_BYTES) {
+      skipped.push({ filename: f.filename, reason: "too large (max 2 MB)" });
+      continue;
+    }
+    const text = fileToText(f.filename, f.contentType, buffer);
+    if (text === null) {
+      skipped.push({ filename: f.filename, reason: "unsupported file type (use text, Markdown, CSV, JSON, HTML)" });
+      continue;
+    }
+    const chunks = chunkText(text);
+    if (!chunks.length) {
+      skipped.push({ filename: f.filename, reason: "no readable text found" });
+      continue;
+    }
+    const sourceId = crypto.randomUUID();
+    await db.execute({
+      sql: "INSERT INTO kb_sources (id, kb_id, type, name, status, fetched_at) VALUES (?, ?, 'file', ?, 'ready', ?)",
+      args: [sourceId, kb.id, f.filename, (/* @__PURE__ */ new Date()).toISOString()]
+    });
+    await addChunks(db, kb.id, sourceId, chunks);
+    indexed.push({ filename: f.filename, chunks: chunks.length });
+  }
+  await touch(db, kb.id);
+  return c.json({ success: true, indexed, skipped });
+});
+router9.delete("/sources/:id", async (c) => {
+  const user = await authenticate(c);
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const db = await getDb();
+  const kb = await loadKb(db, user);
+  if (!await ownsRow(db, "kb_sources", c.req.param("id"), kb.id)) return c.json({ error: "Not found" }, 404);
+  await deleteSource(db, kb.id, c.req.param("id"));
+  return c.json({ success: true });
+});
+router9.post("/publish", async (c) => {
+  const user = await authenticate(c);
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const db = await getDb();
+  const kb = await loadKb(db, user);
+  if (!kb.slug || !isValidSlug(kb.slug)) return c.json({ error: "Set a valid URL slug before publishing" }, 400);
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  await db.execute({ sql: "UPDATE knowledge_bases SET status = 'published', published_at = ?, updated_at = ? WHERE id = ?", args: [now, now, kb.id] });
+  const row = (await db.execute({ sql: "SELECT * FROM knowledge_bases WHERE id = ?", args: [kb.id] })).rows[0];
+  return c.json(row);
+});
+router9.post("/unpublish", async (c) => {
+  const user = await authenticate(c);
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const db = await getDb();
+  const kb = await loadKb(db, user);
+  await db.execute({ sql: "UPDATE knowledge_bases SET status = 'draft', updated_at = ? WHERE id = ?", args: [(/* @__PURE__ */ new Date()).toISOString(), kb.id] });
+  const row = (await db.execute({ sql: "SELECT * FROM knowledge_bases WHERE id = ?", args: [kb.id] })).rows[0];
+  return c.json(row);
+});
+var crawlSchema = z7.object({
+  source_url: z7.string().min(1).max(2e3),
+  limit: z7.number().optional(),
+  max_depth: z7.number().optional(),
+  include_paths: z7.string().max(500).optional(),
+  exclude_paths: z7.string().max(500).optional()
+});
+router9.post("/crawl", async (c) => {
+  const user = await authenticate(c);
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const d = crawlSchema.parse(await c.req.json());
+  const db = await getDb();
+  const kb = await loadKb(db, user);
+  try {
+    const { jobId } = await startCrawl(db, kb.id, {
+      sourceUrl: d.source_url,
+      limit: d.limit,
+      maxDepth: d.max_depth,
+      includePaths: (d.include_paths ?? "").split(","),
+      excludePaths: (d.exclude_paths ?? "").split(",")
+    });
+    const job = await processCrawl(db, jobId, 2e4);
+    return c.json(job);
+  } catch (e) {
+    return c.json({ error: e.message }, 400);
+  }
+});
+router9.get("/crawl/:id", async (c) => {
+  const user = await authenticate(c);
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const db = await getDb();
+  const kb = await loadKb(db, user);
+  const job = await getCrawlJob(db, c.req.param("id"));
+  if (!job || job.kb_id !== kb.id) return c.json({ error: "Not found" }, 404);
+  return c.json(job);
+});
+router9.post("/crawl/:id/resume", async (c) => {
+  const user = await authenticate(c);
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const db = await getDb();
+  const kb = await loadKb(db, user);
+  const job = await getCrawlJob(db, c.req.param("id"));
+  if (!job || job.kb_id !== kb.id) return c.json({ error: "Not found" }, 404);
+  if (job.status === "done" || job.status === "failed" || job.status === "cancelled") return c.json(job);
+  if (job.status === "paused") {
+    await db.execute({ sql: "UPDATE kb_crawl_jobs SET status = 'queued' WHERE id = ?", args: [job.id] });
+  }
+  return c.json(await processCrawl(db, job.id, 2e4));
+});
+router9.post("/crawl/:id/cancel", async (c) => {
+  const user = await authenticate(c);
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const db = await getDb();
+  const kb = await loadKb(db, user);
+  const job = await getCrawlJob(db, c.req.param("id"));
+  if (!job || job.kb_id !== kb.id) return c.json({ error: "Not found" }, 404);
+  return c.json(await cancelCrawl(db, job.id));
+});
+router9.post("/preview", async (c) => {
+  const user = await authenticate(c);
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const { query } = z7.object({ query: z7.string().max(500) }).parse(await c.req.json());
+  const db = await getDb();
+  const context = await getKnowledgeContext(db, user.id, query ?? "");
+  return c.json({ context });
+});
+async function ownsRow(db, table, id, kbId) {
+  const row = (await db.execute({ sql: `SELECT id FROM ${table} WHERE id = ? AND kb_id = ?`, args: [id, kbId] })).rows[0];
+  return !!row;
+}
+async function touch(db, kbId) {
+  await db.execute({ sql: "UPDATE knowledge_bases SET updated_at = ? WHERE id = ?", args: [(/* @__PURE__ */ new Date()).toISOString(), kbId] });
+}
+var knowledge_default = router9;
+
+// src/routes/public.ts
+import { Hono as Hono10 } from "hono";
+var router10 = new Hono10();
+router10.get("/kb/:slug", async (c) => {
+  const db = await getDb();
+  const kb = await getPublicKb(db, c.req.param("slug"));
+  if (!kb) return c.json({ error: "Knowledge base not found" }, 404);
+  c.header("Cache-Control", "public, max-age=60");
+  return c.json(kb);
+});
+var public_default = router10;
 
 // src/index.ts
 var extraOrigins = (process.env.CORS_ORIGINS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
-var app = new Hono8();
+var app = new Hono11();
 app.use("/*", cors({
   origin: [
     "http://localhost:5173",
@@ -2122,7 +3351,10 @@ app.route("/api/messages", messages_default);
 app.route("/api/ai", ai_default);
 app.route("/api/conversations", conversations_default);
 app.route("/api/webhooks/whatsapp", whatsapp_webhook_default);
+app.route("/api/webhooks/plivo", plivo_webhook_default);
 app.route("/api/admin", admin_default);
+app.route("/api/knowledge", knowledge_default);
+app.route("/api/public", public_default);
 app.get("/api/health", (c) => c.json({ status: "ok" }));
 app.onError((err, c) => {
   console.error("[onError]", err);

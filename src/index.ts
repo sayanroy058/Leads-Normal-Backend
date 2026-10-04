@@ -7,7 +7,10 @@ import messagesRoutes from "./routes/messages";
 import aiRoutes from "./routes/ai";
 import conversationsRoutes from "./routes/conversations";
 import whatsappWebhookRoutes from "./routes/whatsapp-webhook";
+import plivoWebhookRoutes from "./routes/plivo-webhook";
 import adminRoutes from "./routes/admin";
+import knowledgeRoutes from "./routes/knowledge";
+import publicRoutes from "./routes/public";
 
 const extraOrigins = (process.env.CORS_ORIGINS ?? "")
   .split(",")
@@ -32,7 +35,10 @@ app.route("/api/messages", messagesRoutes);
 app.route("/api/ai", aiRoutes);
 app.route("/api/conversations", conversationsRoutes);
 app.route("/api/webhooks/whatsapp", whatsappWebhookRoutes); // public — Meta/bridge webhook
+app.route("/api/webhooks/plivo", plivoWebhookRoutes); // public — Agentflow event callbacks
 app.route("/api/admin", adminRoutes);
+app.route("/api/knowledge", knowledgeRoutes); // authed — owner's own KB
+app.route("/api/public", publicRoutes); // public — published KB, read-only
 
 app.get("/api/health", (c) => c.json({ status: "ok" }));
 
