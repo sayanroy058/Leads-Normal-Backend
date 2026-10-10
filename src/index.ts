@@ -11,6 +11,8 @@ import plivoWebhookRoutes from "./routes/plivo-webhook";
 import adminRoutes from "./routes/admin";
 import knowledgeRoutes from "./routes/knowledge";
 import publicRoutes from "./routes/public";
+import apiKeysRoutes from "./routes/api-keys";
+import externalRoutes from "./routes/external";
 
 const extraOrigins = (process.env.CORS_ORIGINS ?? "")
   .split(",")
@@ -39,6 +41,8 @@ app.route("/api/webhooks/plivo", plivoWebhookRoutes); // public — Agentflow ev
 app.route("/api/admin", adminRoutes);
 app.route("/api/knowledge", knowledgeRoutes); // authed — owner's own KB
 app.route("/api/public", publicRoutes); // public — published KB, read-only
+app.route("/api/keys", apiKeysRoutes); // dashboard — manage API keys (session auth)
+app.route("/api/v1", externalRoutes); // external REST API — API-key auth (see API.md)
 
 app.get("/api/health", (c) => c.json({ status: "ok" }));
 

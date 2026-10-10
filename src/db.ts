@@ -39,6 +39,20 @@ const TABLE_DDL = [
     created_at TEXT DEFAULT (datetime('now')),
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   )`,
+  // API keys for the external REST API (see routes/external.ts). Only the
+  // SHA-256 hash and a short display prefix are stored — the raw key is shown
+  // once at creation and never persisted.
+  `CREATE TABLE IF NOT EXISTS api_keys (
+    id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name TEXT,
+    key_hash TEXT NOT NULL UNIQUE,
+    prefix TEXT,
+    last_used_at TEXT,
+    revoked_at TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id)`,
   `CREATE TABLE IF NOT EXISTS leads (
     id TEXT PRIMARY KEY,
     user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
