@@ -2,8 +2,8 @@ import { Hono } from "hono";
 import { getDb } from "../db";
 import { getPublicKb } from "../lib/knowledge";
 
-// Public, unauthenticatedKnowledge Base API. Exposes ONLY the published
-// projection of a KB (nickname, profile, sections, FAQ) — never the owner id,
+// Public, unauthenticated Knowledge Base API. Exposes ONLY the published
+// projection of a KB (title + free-text content) — never the owner id,
 // leads, or credentials. Mounted at /api/public.
 
 const router = new Hono();

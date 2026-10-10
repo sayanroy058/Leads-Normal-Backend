@@ -5,8 +5,29 @@
 // frontier in the job row. The UI polls the job and calls resume until it
 // finishes. Same-host only, robots.txt-aware, with include/exclude path globs.
 
+// This module is no longer wired into any route. The KB was simplified to
+// free-text only (see routes/knowledge.ts + lib/knowledge.ts), so the website
+// crawl feature is retired. Kept here so a future rebuild can revive it.
+
 import type { Client } from "@libsql/client";
-import { addChunks, chunkText, deleteSourceChunks, htmlToText } from "./knowledge";
+
+// Stubs for the functions that used to live in knowledge.ts.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function addChunks(_db: Client, _kbId: string, _sourceId: string | null, _texts: string[]): Promise<void> {
+  return Promise.resolve();
+}
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function chunkText(_text: string, _maxLen?: number, _overlap?: number): string[] {
+  return [];
+}
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function deleteSourceChunks(_db: Client, _kbId: string, _sourceId: string): Promise<void> {
+  return Promise.resolve();
+}
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function htmlToText(_html: string): string {
+  return "";
+}
 
 const USER_AGENT = "GradLeadAI-KnowledgeBot/1.0";
 const FETCH_TIMEOUT_MS = 8000;

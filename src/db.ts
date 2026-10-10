@@ -163,12 +163,7 @@ const TABLE_DDL = [
     user_id INTEGER UNIQUE REFERENCES users(id) ON DELETE CASCADE,
     slug TEXT UNIQUE,
     title TEXT,
-    tagline TEXT,
-    description TEXT,
-    contact_email TEXT,
-    contact_phone TEXT,
-    contact_website TEXT,
-    contact_address TEXT,
+    content TEXT,
     status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','published')),
     published_at TEXT,
     created_at TEXT DEFAULT (datetime('now')),
@@ -305,6 +300,13 @@ const CALL_LOG_MIGRATIONS = [
   `ALTER TABLE call_logs ADD COLUMN plivo_api_id TEXT`,
 ];
 
+// Knowledge Base schema migration: old databases have tagline/description/contact_*
+// columns from the structured KB; new ones just have `content`. Add the content
+// column idempotently — ALTER TABLE fails once applied, so the error is swallowed.
+const KB_MIGRATIONS = [
+  `ALTER TABLE knowledge_bases ADD COLUMN content TEXT`,
+];
+
 // Hardcoded demo account so login works out of the box.
 //   email:    testuser@gmail.com
 //   password: Str0ng!P9a  (10 chars: upper + lower + digit + symbol)
@@ -328,7 +330,7 @@ async function initDb(c: Client) {
 
   // Column migrations run individually — ALTER TABLE cannot be batched with
   // a guaranteed outcome, and duplicate-column errors are expected once applied.
-  for (const sql of [...EMAIL_MESSAGE_MIGRATIONS, ...WHATSAPP_MESSAGE_MIGRATIONS, ...ATTACHMENT_MIGRATIONS, ...USER_ACCESS_MIGRATIONS, ...TENANCY_MIGRATIONS, ...CALL_LOG_MIGRATIONS]) {
+  for (const sql of [...EMAIL_MESSAGE_MIGRATIONS, ...WHATSAPP_MESSAGE_MIGRATIONS, ...ATTACHMENT_MIGRATIONS, ...USER_ACCESS_MIGRATIONS, ...TENANCY_MIGRATIONS, ...CALL_LOG_MIGRATIONS, ...KB_MIGRATIONS]) {
     try {
       await c.execute(sql);
     } catch {
