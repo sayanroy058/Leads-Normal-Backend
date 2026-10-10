@@ -6,6 +6,12 @@ calling agent (Plivo)** — after a call, the agent calls this API to save what 
 learned (e.g. *"2 BHK Flat in Newtown, Kolkata"*), and the change appears on the
 dashboard immediately.
 
+It also handles **inbound** calls: `POST /leads/lookup` takes the caller's phone
+number and resolves it to a lead — returning the stored details when the number
+is already in the workspace, and creating a new lead when it isn't — so the same
+agent can answer a returning caller from their history and capture a first-time
+caller from scratch.
+
 Every request is scoped to the owner of the API key: a key can only ever see and
 modify that account's leads. There is no cross-tenant access.
 
@@ -177,7 +183,80 @@ curl -X POST https://<base>/leads \
 
 ---
 
-### 4. `GET /leads/:id` — get one lead
+### 4. `POST /leads/lookup` — identify an inbound caller (find or create)
+
+The entry point for an **inbound** call. Post the caller's number and get back
+the lead it belongs to — or a brand-new one created for it.
+
+Matching ignores formatting and country-code differences, so `+91 90629 86383`,
+`+919062986383` and `9062986383` all resolve to the **same** lead. Only this
+account's leads are searched; a caller belonging to someone else is never
+returned.
+
+**Body**
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `phone` | string | **yes** | The caller's number. At least 7 digits, country code when available. |
+| `name` | string | no | Used only when a lead is created. |
+| `email`, `company`, `city`, `source`, `notes` | string\|null | no | Stored only when a lead is created. |
+| `interest`, `category`, `region`, `urgency` | string\|null | no | Stored only when a lead is created. |
+| `value`, `budget_min`, `budget_max` | number\|null | no | Stored only when a lead is created. |
+| `status` | string | no | Defaults to `new`. |
+| `requirements` | array | no | `{ label, value }` pairs — what the caller asked for. Stored only when a lead is created. |
+| `goal` | string\|null | no | What this call should achieve; added to `agent_brief`. |
+| `include_knowledge` | boolean | no | Default `true`. `false` leaves the business knowledge base out of `agent_brief`. |
+
+```bash
+curl -X POST https://<base>/leads/lookup \
+  -H "X-API-Key: gld_..." -H "Content-Type: application/json" \
+  -d '{
+    "phone": "+91 90629 86383",
+    "name": "Sayan Roy",
+    "city": "Kolkata",
+    "source": "inbound-call",
+    "requirements": [ { "label": "Property", "value": "2 BHK Flat in Newtown, Kolkata" } ]
+  }'
+```
+
+**Response**
+
+| Case | Status | `found` | `created` |
+|---|---|---|---|
+| Number already on file | `200` | `true` | `false` |
+| Unknown number (lead just created) | `201` | `false` | `true` |
+
+```json
+{
+  "found": true,
+  "created": false,
+  "lead": { "id": "32705d13-…", "name": "Sayan Roy", "phone": "+91 90629 86383", "status": "qualified", "requirements": [ … ], "…": "…" },
+  "agent_brief": "You are answering an inbound call on behalf of GradLeadAI. …"
+}
+```
+
+- **`lead`** — the full Lead object, with `requirements` parsed.
+- **`agent_brief`** — the text the voice agent speaks from: who the caller is,
+everything on file for them, and (unless `include_knowledge: false`) the
+business knowledge base. Hand it to the agent as its system prompt.
+
+**When the caller is already on file**, the request body's other fields are
+**not** applied — the stored lead is returned exactly as it is, so a lookup can
+never overwrite good data. To change the lead, use `PATCH /leads/:id` or one of
+the requirement endpoints.
+
+**When the caller is new**, the supplied fields and `requirements` are stored on
+the created lead. If no `name` is given, the lead is created with the **phone
+number as its name** (a stranger has no name yet) — rename it during the call
+with `PATCH /leads/:id`, e.g. `{ "name": "Sayan Roy" }`.
+
+**Side effects:** the lookup records an inbound `call` event on the lead's
+timeline (so it shows up in the dashboard's conversation view) and refreshes
+`last_activity`.
+
+---
+
+### 5. `GET /leads/:id` — get one lead
 
 ```bash
 curl https://<base>/leads/32705d13 -H "X-API-Key: gld_..."
@@ -187,7 +266,7 @@ curl https://<base>/leads/32705d13 -H "X-API-Key: gld_..."
 
 ---
 
-### 5. `PATCH /leads/:id` — update lead fields
+### 6. `PATCH /leads/:id` — update lead fields
 
 Updates only the fields you send (partial update). Send any subset of the fields
 listed for `POST /leads`, **including `requirements`** to replace the whole list.
@@ -203,7 +282,7 @@ curl -X PATCH https://<base>/leads/32705d13 \
 
 ---
 
-### 6. `PUT /leads/:id/requirements` — replace all requirements
+### 7. `PUT /leads/:id/requirements` — replace all requirements
 
 Best when the agent has the **complete** requirement set after a call.
 
@@ -223,7 +302,7 @@ curl -X PUT https://<base>/leads/32705d13/requirements \
 
 ---
 
-### 7. `POST /leads/:id/requirements` — add or update one requirement
+### 8. `POST /leads/:id/requirements` — add or update one requirement
 
 The most convenient tool for an agent: records a single detail as it is learned.
 If a requirement with the same label already exists (case-insensitive), it is
@@ -246,7 +325,7 @@ curl -X POST https://<base>/leads/32705d13/requirements \
 
 ---
 
-### 8. `DELETE /leads/:id/requirements/:label` — remove one requirement
+### 9. `DELETE /leads/:id/requirements/:label` — remove one requirement
 
 Removes the requirement whose label matches (case-insensitive). URL-encode the
 label (spaces as `%20`).
@@ -261,6 +340,41 @@ curl -X DELETE "https://<base>/leads/32705d13/requirements/Handover" \
 ---
 
 ## Common workflow — AI calling agent
+
+### Inbound call (the caller dials the business's number)
+
+One request answers "who is this?". The agent then holds the conversation from
+`agent_brief` — the caller's own details plus the business knowledge base — and
+writes back anything new:
+
+```bash
+# 1) The call connects. Identify the caller.
+curl -s -X POST https://<base>/leads/lookup \
+  -H "X-API-Key: gld_..." -H "Content-Type: application/json" \
+  -d '{"phone": "+919062986383", "goal": "Help with their property enquiry"}' \
+  -o caller.json
+
+# found:true   → returning contact — answer from their stored requirements/
+#                history in `lead`, with `agent_brief` as the system prompt.
+# found:false  → first-time caller — a lead now exists for that number.
+
+LEAD=$(node -e 'console.log(require("./caller.json").lead.id)')
+
+# 2) As the call goes on, store what you learn (same endpoints as outbound).
+curl -X PATCH https://<base>/leads/$LEAD \
+  -H "X-API-Key: gld_..." -H "Content-Type: application/json" \
+  -d '{"name":"Sayan Roy","status":"qualified"}'
+
+curl -X POST https://<base>/leads/$LEAD/requirements \
+  -H "X-API-Key: gld_..." -H "Content-Type: application/json" \
+  -d '{"label":"Budget","value":"60L - 80L"}'
+```
+
+Looking the caller up repeatedly during one call is safe: an existing lead is
+returned untouched, and only the first lookup for an unknown number creates one.
+(It does add an inbound `call` event per lookup, so send it once per call.)
+
+### Outbound call (the agent dials the lead)
 
 After a call, the agent resolves the lead and writes back what it learned:
 

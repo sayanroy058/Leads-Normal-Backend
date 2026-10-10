@@ -50,6 +50,10 @@ export function normalizePhone(raw: string | null | undefined): string | null {
  * Build the brief the AI agent speaks from: who this person is and what they
  * asked for. This is the whole point of the feature — the agent talks to the
  * lead about *their own recorded requirements*, not a generic script.
+ *
+ * Used in both directions: for an outbound call the agent places (default), and
+ * for an inbound call the agent answers (`{ inbound: true }` — see
+ * routes/external.ts `/leads/lookup`), where "you are calling" would be wrong.
  */
 export function buildAgentBrief(lead: {
   name: string; company: string | null; city: string | null; phone: string | null;
@@ -57,7 +61,7 @@ export function buildAgentBrief(lead: {
   budget_min: number | null; budget_max: number | null; region: string | null;
   urgency: string | null; value: number | null; status: string; score: number;
   requirements?: unknown;
-}, goal?: string | null): string {
+}, goal?: string | null, opts: { inbound?: boolean } = {}): string {
   const budget =
     lead.budget_min != null && lead.budget_max != null
       ? `${lead.budget_min}–${lead.budget_max}`
@@ -85,13 +89,15 @@ export function buildAgentBrief(lead: {
     lead.notes ? `Notes: ${brief(lead.notes, 800)}` : null,
   ].filter(Boolean) as string[];
 
-  return [
-    "You are calling a sales lead on behalf of GradLeadAI. Use ONLY the details below when speaking to them.",
-    "",
-    ...facts,
-    "",
-    "Open by identifying yourself and referring to their stated requirement. Confirm the details, answer their questions, and aim to move them to the next step. If something is not in these details, say so and offer to follow up — do not invent facts, prices, or dates.",
-  ].join("\n");
+  const intro = opts.inbound
+    ? "You are answering an inbound call on behalf of GradLeadAI from the person below. Use ONLY the details below when speaking to them."
+    : "You are calling a sales lead on behalf of GradLeadAI. Use ONLY the details below when speaking to them.";
+
+  const guidance = opts.inbound
+    ? "Greet the caller and say who you are, then answer their questions from these details. They may be an existing contact or a first-time enquiry — if they ask for something new, capture it. If something is not in these details, say so and offer to follow up — do not invent facts, prices, or dates."
+    : "Open by identifying yourself and referring to their stated requirement. Confirm the details, answer their questions, and aim to move them to the next step. If something is not in these details, say so and offer to follow up — do not invent facts, prices, or dates.";
+
+  return [intro, "", ...facts, "", guidance].join("\n");
 }
 
 export interface DialResult {

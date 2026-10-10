@@ -3,6 +3,10 @@ import { z } from "zod";
 import { getDb } from "../db";
 import { authenticateApiKey, type ApiKeyContext } from "../middleware/api-key";
 import { parseRequirements, serializeRequirements, normalizeLeadRequirements } from "../lib/lead-requirements";
+import { phoneMatches } from "../lib/whatsapp";
+import { buildAgentBrief } from "../lib/plivo-agentflow";
+import { getKnowledgeContext } from "../lib/knowledge";
+import { insertEvent } from "../lib/events";
 import { LEAD_STATUSES, computeLeadScore } from "./leads";
 
 // Public, API-key authenticated REST API (`/api/v1`). This is what an external
@@ -56,6 +60,18 @@ const leadFieldsSchema = z.object({
 
 const createLeadSchema = leadFieldsSchema.extend({ name: z.string().min(1).max(200) });
 const patchLeadSchema = leadFieldsSchema;
+
+// Caller identification for inbound calls. `phone` is the only required field
+// (it is the identity); everything else is stored when a new lead is created.
+const lookupSchema = leadFieldsSchema.extend({
+  phone: z.string().min(3).max(40),
+  goal: z.string().max(500).nullable().optional(),
+  include_knowledge: z.boolean().optional(),
+});
+
+// A caller ID shorter than this would "match" a stored number on a single
+// shared digit, so refuse to guess rather than hand the agent the wrong person.
+const MIN_PHONE_DIGITS = 7;
 
 type Row = Record<string, unknown>;
 
@@ -133,6 +149,120 @@ router.post("/leads", async (c) => {
     });
     const row = (await db.execute({ sql: "SELECT * FROM leads WHERE id = ?", args: [id] })).rows[0] as unknown as Row;
     return c.json(normalizeLeadRequirements(row), 201);
+  } catch (e) {
+    return c.json({ error: "Bad request", message: (e as Error).message }, 400);
+  }
+});
+
+// ---- Inbound caller identification ----------------------------------------
+
+// The inbound half of the voice-agent integration: the agent answers a call on
+// the business's number and immediately posts the caller's number here.
+//
+//   * number already on file → that lead comes back (`found: true`, HTTP 200),
+//     together with a brief the agent can answer the caller from;
+//   * unknown number         → a new lead is created (`created: true`, HTTP 201)
+//     so everything captured on the call has somewhere to live.
+//
+// Matching is tolerant of formatting and country-code differences (the same
+// helper the WhatsApp inbound webhook uses), so "+91 90629 86383",
+// "+919062986383" and "9062986383" are one person.
+router.post("/leads/lookup", async (c) => {
+  const api = c.get("api");
+  try {
+    const body = lookupSchema.parse(await c.req.json());
+    const { goal, include_knowledge, ...fields } = body;
+    const digits = fields.phone.replace(/\D/g, "");
+    if (digits.length < MIN_PHONE_DIGITS) {
+      return c.json(
+        {
+          error: "Bad request",
+          message: `\`phone\` must contain at least ${MIN_PHONE_DIGITS} digits (include the caller's country code when you have it).`,
+        },
+        400,
+      );
+    }
+
+    const db = await getDb();
+    const now = new Date().toISOString();
+
+    // A number can exist more than once (imports, hand-entered rows) — prefer
+    // the most recently active match, exactly like the leads list ordering.
+    const candidates = (
+      await db.execute({
+        sql: "SELECT * FROM leads WHERE user_id = ? AND phone IS NOT NULL AND phone != '' ORDER BY COALESCE(last_activity, created_at) DESC",
+        args: [api.userId],
+      })
+    ).rows as unknown as Row[];
+    const existing = candidates.find((r) => phoneMatches(String(r.phone), fields.phone));
+
+    let lead: Row;
+    if (existing) {
+      // An inbound call is activity: bump last_activity so the lead is at the
+      // top of the dashboard and the inbox. Nothing else is overwritten.
+      await db.execute({
+        sql: "UPDATE leads SET last_activity = ? WHERE id = ? AND user_id = ?",
+        args: [now, String(existing.id), api.userId],
+      });
+      lead = normalizeLeadRequirements({ ...existing, last_activity: now });
+    } else {
+      const id = crypto.randomUUID();
+      // A stranger has no name yet — the number is the only identity we have.
+      // The agent can rename the lead later with `PATCH /leads/:id`.
+      const name = fields.name?.trim() || fields.phone.trim();
+      const source = fields.source ?? "inbound-call";
+      await db.execute({
+        sql: `INSERT INTO leads
+          (id, user_id, name, email, phone, company, source, status, score, value, city, notes, last_activity, created_at,
+           interest, category, budget_min, budget_max, region, urgency, requirements)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        args: [
+          id, api.userId, name, fields.email ?? null, fields.phone.trim(), fields.company ?? null, source,
+          fields.status ?? "new", computeLeadScore({ ...fields, name, source, requirements: undefined }),
+          fields.value ?? null, fields.city ?? null, fields.notes ?? null, now, now,
+          fields.interest ?? null, fields.category ?? null, fields.budget_min ?? null, fields.budget_max ?? null,
+          fields.region ?? null, fields.urgency ?? null, serializeRequirements(fields.requirements),
+        ],
+      });
+      lead = normalizeLeadRequirements(
+        (await db.execute({ sql: "SELECT * FROM leads WHERE id = ?", args: [id] })).rows[0] as unknown as Row,
+      );
+    }
+
+    // Put the call on the lead's timeline (the same unified event model every
+    // other channel writes to) so the dashboard's conversation view shows it.
+    await insertEvent(db, {
+      lead_id: String(lead.id),
+      channel: "call",
+      type: "call",
+      direction: "inbound",
+      handled_by: "ai",
+      action: "inbound-call",
+      summary: existing ? "Inbound call — returning contact" : "Inbound call — new contact",
+      metadata: { from: fields.phone, identified: Boolean(existing) },
+      created_at: now,
+    });
+
+    // The brief the agent speaks from, grounded in the business knowledge base
+    // (same composition as the outbound path in routes/messages.ts). Turn the
+    // knowledge base off with `"include_knowledge": false` for a leaner reply.
+    const kbContext =
+      include_knowledge === false
+        ? ""
+        : await getKnowledgeContext(db, api.userId, [fields.interest, fields.category, goal].filter(Boolean).join(" "));
+    const brief =
+      buildAgentBrief(lead as unknown as Parameters<typeof buildAgentBrief>[0], goal ?? null, { inbound: true }) +
+      (kbContext ? `\n\nBusiness knowledge base (answer questions about the business from this — do not invent facts):\n${kbContext}` : "");
+
+    return c.json(
+      {
+        found: Boolean(existing),
+        created: !existing,
+        lead,
+        agent_brief: brief,
+      },
+      existing ? 200 : 201,
+    );
   } catch (e) {
     return c.json({ error: "Bad request", message: (e as Error).message }, 400);
   }
