@@ -59,6 +59,7 @@ const TABLE_DDL = [
     budget_max REAL,
     region TEXT,
     urgency TEXT,
+    requirements TEXT,
     created_at TEXT DEFAULT (datetime('now'))
   )`,
   `CREATE TABLE IF NOT EXISTS email_messages (
@@ -307,6 +308,13 @@ const KB_MIGRATIONS = [
   `ALTER TABLE knowledge_bases ADD COLUMN content TEXT`,
 ];
 
+// Flexible per-lead requirements: an ordered JSON array of { label, value }
+// pairs (property type, budget, handover time, and anything else). Added
+// idempotently so pre-existing databases pick up the column on cold start.
+const LEAD_REQUIREMENT_MIGRATIONS = [
+  `ALTER TABLE leads ADD COLUMN requirements TEXT`,
+];
+
 // Hardcoded demo account so login works out of the box.
 //   email:    testuser@gmail.com
 //   password: Str0ng!P9a  (10 chars: upper + lower + digit + symbol)
@@ -330,7 +338,7 @@ async function initDb(c: Client) {
 
   // Column migrations run individually — ALTER TABLE cannot be batched with
   // a guaranteed outcome, and duplicate-column errors are expected once applied.
-  for (const sql of [...EMAIL_MESSAGE_MIGRATIONS, ...WHATSAPP_MESSAGE_MIGRATIONS, ...ATTACHMENT_MIGRATIONS, ...USER_ACCESS_MIGRATIONS, ...TENANCY_MIGRATIONS, ...CALL_LOG_MIGRATIONS, ...KB_MIGRATIONS]) {
+  for (const sql of [...EMAIL_MESSAGE_MIGRATIONS, ...WHATSAPP_MESSAGE_MIGRATIONS, ...ATTACHMENT_MIGRATIONS, ...USER_ACCESS_MIGRATIONS, ...TENANCY_MIGRATIONS, ...CALL_LOG_MIGRATIONS, ...KB_MIGRATIONS, ...LEAD_REQUIREMENT_MIGRATIONS]) {
     try {
       await c.execute(sql);
     } catch {
@@ -429,9 +437,10 @@ async function migrateLeadsToGenericPipeline(c: Client) {
         budget_max REAL,
         region TEXT,
         urgency TEXT,
+        requirements TEXT,
         created_at TEXT DEFAULT (datetime('now'))
       )`,
-      `INSERT INTO leads_generic (id, user_id, name, email, phone, company, source, status, score, value, city, notes, last_activity, created_at, interest, category, budget_min, budget_max, region, urgency)
+      `INSERT INTO leads_generic (id, user_id, name, email, phone, company, source, status, score, value, city, notes, last_activity, created_at, interest, category, budget_min, budget_max, region, urgency, requirements)
          SELECT id,
                 ${has("user_id") ? "user_id" : "NULL"},
                 name, email, phone, company, source,
@@ -442,7 +451,8 @@ async function migrateLeadsToGenericPipeline(c: Client) {
                 ${selectOr("budget_min")},
                 ${selectOr("budget_max")},
                 ${selectOr("area")},
-                ${selectOr("urgency")}
+                ${selectOr("urgency")},
+                ${selectOr("requirements")}
          FROM leads`,
       `DROP TABLE leads`,
       `ALTER TABLE leads_generic RENAME TO leads`,

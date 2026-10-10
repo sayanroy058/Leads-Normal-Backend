@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { InStatement } from "@libsql/client";
 import { getDb } from "../db";
 import { authenticate } from "../middleware/auth";
+import { parseRequirements, serializeRequirements, normalizeLeadRequirements } from "../lib/lead-requirements";
 
 const router = new Hono();
 
@@ -12,13 +13,22 @@ router.get("/", async (c) => {
   const rows = (
     await (await getDb()).execute({ sql: "SELECT * FROM leads WHERE user_id = ? ORDER BY created_at DESC", args: [user.id] })
   ).rows;
-  return c.json(rows);
+  // requirements is stored as a JSON string; hand it back as a parsed array.
+  return c.json((rows as unknown as Record<string, unknown>[]).map(normalizeLeadRequirements));
 });
 
 // Generic pipeline stages.
 export const LEAD_STATUSES = ["new", "contacted", "qualified", "meeting", "proposal", "closed", "lost"] as const;
 
 export type LeadStatus = (typeof LEAD_STATUSES)[number];
+
+// One requirement row. Either side may be blank, so the AI agent can add a
+// bare label ("Owns a car") or a bare value under a default heading.
+const requirementItemSchema = z.object({
+  label: z.string().max(80).default(""),
+  value: z.string().max(1000).default(""),
+});
+const requirementListSchema = z.array(requirementItemSchema).max(50).nullable().optional();
 
 const leadSchema = z.object({
   name: z.string(),
@@ -38,6 +48,8 @@ const leadSchema = z.object({
   budget_max: z.number().nullable().optional(),
   region: z.string().nullable().optional(),
   urgency: z.string().nullable().optional(),
+  // Flexible requirement list — label/value pairs (property, budget, handover…).
+  requirements: requirementListSchema,
 });
 
 const updateLeadSchema = z.object({
@@ -58,6 +70,7 @@ const updateLeadSchema = z.object({
   budget_max: z.number().nullable().optional(),
   region: z.string().nullable().optional(),
   urgency: z.string().nullable().optional(),
+  requirements: requirementListSchema,
 });
 
 const SCORE_FIELDS = [
@@ -86,10 +99,10 @@ router.post("/bulk", async (c) => {
     const id = crypto.randomUUID();
     const now = new Date().toISOString();
     statements.push({
-      sql: "INSERT OR REPLACE INTO leads (id, user_id, name, email, phone, company, source, status, score, value, city, notes, last_activity, created_at, interest, category, budget_min, budget_max, region, urgency) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      args: [id, user.id, r.name, r.email ?? null, r.phone ?? null, r.company ?? null, r.source ?? "import", r.status ?? "new", computeLeadScore(r), r.value ?? null, r.city ?? null, r.notes ?? null, now, now, r.interest ?? null, r.category ?? null, r.budget_min ?? null, r.budget_max ?? null, r.region ?? null, r.urgency ?? null],
+      sql: "INSERT OR REPLACE INTO leads (id, user_id, name, email, phone, company, source, status, score, value, city, notes, last_activity, created_at, interest, category, budget_min, budget_max, region, urgency, requirements) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      args: [id, user.id, r.name, r.email ?? null, r.phone ?? null, r.company ?? null, r.source ?? "import", r.status ?? "new", computeLeadScore(r), r.value ?? null, r.city ?? null, r.notes ?? null, now, now, r.interest ?? null, r.category ?? null, r.budget_min ?? null, r.budget_max ?? null, r.region ?? null, r.urgency ?? null, serializeRequirements(r.requirements)],
     });
-    inserted.push({ ...r, id, status: r.status ?? "new", score: computeLeadScore(r), last_activity: now, created_at: now });
+    inserted.push({ ...r, id, status: r.status ?? "new", score: computeLeadScore(r), last_activity: now, created_at: now, requirements: parseRequirements(r.requirements) });
   }
   if (statements.length) await db.batch(statements, "write"); // atomic import
   return c.json(inserted);
@@ -166,7 +179,7 @@ router.get("/:id", async (c) => {
   if (!user) return c.json({ error: "Unauthorized" }, 401);
   const row = (await (await getDb()).execute({ sql: "SELECT * FROM leads WHERE id = ? AND user_id = ?", args: [c.req.param("id"), user.id] })).rows[0];
   if (!row) return c.json({ error: "Lead not found" }, 404);
-  return c.json(row);
+  return c.json(normalizeLeadRequirements(row as unknown as Record<string, unknown>));
 });
 
 router.put("/:id", async (c) => {
@@ -182,6 +195,11 @@ router.put("/:id", async (c) => {
   const vals: (string | number | null)[] = [];
   for (const [k, v] of Object.entries(data)) {
     if (k === "score") continue; // score is auto-computed from field completeness
+    if (k === "requirements") {
+      sets.push("requirements = ?");
+      vals.push(serializeRequirements(v));
+      continue;
+    }
     sets.push(`${k} = ?`);
     vals.push(v as string | number | null);
   }
@@ -192,7 +210,7 @@ router.put("/:id", async (c) => {
   vals.push(id, user.id);
   await db.execute({ sql: `UPDATE leads SET ${sets.join(", ")} WHERE id = ? AND user_id = ?`, args: vals });
   const row = (await db.execute({ sql: "SELECT * FROM leads WHERE id = ?", args: [id] })).rows[0];
-  return c.json(row);
+  return c.json(normalizeLeadRequirements(row as unknown as Record<string, unknown>));
 });
 
 router.delete("/:id", async (c) => {

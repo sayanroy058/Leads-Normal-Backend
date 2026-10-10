@@ -52,6 +52,7 @@ async function setup() {
       budget_max REAL,
       region TEXT,
       urgency TEXT,
+      requirements TEXT,
       created_at TEXT DEFAULT (datetime('now'))
     )
   `);

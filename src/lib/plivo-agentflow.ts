@@ -13,6 +13,8 @@
 // configured on the flow's trigger node. Unknown keys are ignored by Plivo, so
 // we send a superset of the common names to bind to whichever the flow uses.
 // Once the flow's variable names are confirmed, trim this to exactly those.
+import { formatRequirements } from "./lead-requirements";
+
 /** Trim a lead's free-text so a very long note can't blow past the flow's prompt limit. */
 function brief(value: string | null | undefined, max = 400): string {
   const s = (value ?? "").trim().replace(/\s+/g, " ");
@@ -54,6 +56,7 @@ export function buildAgentBrief(lead: {
   notes: string | null; interest: string | null; category: string | null;
   budget_min: number | null; budget_max: number | null; region: string | null;
   urgency: string | null; value: number | null; status: string; score: number;
+  requirements?: unknown;
 }, goal?: string | null): string {
   const budget =
     lead.budget_min != null && lead.budget_max != null
@@ -64,6 +67,8 @@ export function buildAgentBrief(lead: {
           ? `from ${lead.budget_min}`
           : null;
 
+  const requirements = formatRequirements(lead.requirements);
+
   const facts = [
     `Lead name: ${lead.name}`,
     lead.company ? `Company: ${lead.company}` : null,
@@ -71,6 +76,7 @@ export function buildAgentBrief(lead: {
     lead.region ? `Region: ${lead.region}` : null,
     lead.interest ? `Requirement / interest: ${lead.interest}` : null,
     lead.category ? `Category: ${lead.category}` : null,
+    requirements ? `Recorded requirements: ${requirements}` : null,
     budget ? `Budget: ${budget}` : null,
     lead.urgency ? `Urgency: ${lead.urgency}` : null,
     lead.value != null ? `Deal value: ${lead.value}` : null,

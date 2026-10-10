@@ -459,6 +459,7 @@ router.post("/calls/dial", async (c) => {
       notes: string | null; interest: string | null; category: string | null;
       budget_min: number | null; budget_max: number | null; region: string | null;
       urgency: string | null; value: number | null; status: string; score: number;
+      requirements: string | null;
     } | undefined;
     if (!lead) return c.json({ error: "Lead not found" }, 404);
     if (!lead.phone) return c.json({ error: `${lead.name} has no phone number — add one before calling.` }, 400);

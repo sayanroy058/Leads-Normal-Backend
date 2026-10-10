@@ -9,6 +9,7 @@ import { sendMessage, type MailerConfig } from "../lib/mailer";
 import { sendText } from "../lib/whatsapp";
 import { insertEvent } from "../lib/events";
 import { getKnowledgeContext } from "../lib/knowledge";
+import { formatRequirements } from "../lib/lead-requirements";
 
 /** This user's own Gmail credentials (set by an admin), falling back to the
  * global env vars for accounts with none configured. */
@@ -44,8 +45,10 @@ function leadsBlock(leads: LeadCtx[]) {
   return leads
     .map((l) => {
       const budget = l.budget_max ? `$${Number(l.budget_max).toLocaleString()}` : "";
+      const requirements = formatRequirements(l.requirements);
       const extras = [
         l.interest ? `interest=${l.interest}` : "",
+        requirements ? `requirements=${requirements}` : "",
         l.category ? `category=${l.category}` : "",
         l.region ? `region=${l.region}` : "",
         budget ? `budget=${budget}` : "",
@@ -59,7 +62,7 @@ function leadsBlock(leads: LeadCtx[]) {
     .join("\n");
 }
 
-type LeadCtx = { id: string; name: string; company: string | null; email: string | null; phone: string | null; city: string | null; status: string; score: number; notes?: string | null; interest?: string | null; category?: string | null; region?: string | null; budget_max?: number | null; urgency?: string | null };
+type LeadCtx = { id: string; name: string; company: string | null; email: string | null; phone: string | null; city: string | null; status: string; score: number; notes?: string | null; interest?: string | null; category?: string | null; region?: string | null; budget_max?: number | null; urgency?: string | null; requirements?: unknown };
 
 const historySchema = z.array(z.object({ role: z.enum(["user", "assistant"]), content: z.string() }));
 
