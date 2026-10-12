@@ -505,8 +505,8 @@ router.post("/calls/dial", async (c) => {
 
     await db.batch([
       {
-        sql: "INSERT INTO call_logs (id, lead_id, goal, status, provider, phlo_id, plivo_api_id, prompt_used, to_number, started_at, created_at) VALUES (?, ?, ?, 'in_progress', 'plivo', ?, ?, ?, ?, ?, ?)",
-        args: [id, lead.id, data.goal ?? null, run.phlo_id, run.api_id, brief, toNumber, now, now],
+        sql: "INSERT INTO call_logs (id, lead_id, user_id, direction, goal, status, provider, phlo_id, plivo_api_id, prompt_used, to_number, started_at, created_at) VALUES (?, ?, ?, 'outbound', ?, 'in_progress', 'plivo', ?, ?, ?, ?, ?, ?)",
+        args: [id, lead.id, user.id, data.goal ?? null, run.phlo_id, run.api_id, brief, toNumber, now, now],
       },
       {
         sql: "INSERT INTO events (id, lead_id, channel, action, summary, source_ref, created_at) VALUES (?, ?, 'call', 'initiated', ?, ?, ?)",
